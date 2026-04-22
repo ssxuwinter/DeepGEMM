@@ -25,6 +25,12 @@ public:
 
         cute::UMMA::Major major_sfb;
         void *sfb, *grouped_layout;
+        // Raw pointers for cp.async load path
+        void *gmem_a;
+        uint32_t stride_a;    // row stride of A in fp8 elements
+        void *gmem_sfa;
+        uint32_t stride_sfa;  // row stride of sfa in float elements (= M for MN-major)
+        // TMA descriptors kept for reference (A/sfa currently unused in kernel)
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
@@ -72,6 +78,8 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.sfb, args.grouped_layout,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
+            args.gmem_a, args.stride_a,
+            args.gmem_sfa, args.stride_sfa,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
     }
@@ -104,6 +112,10 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    // cp.async path: raw pointer and stride
+    const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
+    // TMA descriptors (A/sfa kept for reference, currently unused in kernel)
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -133,6 +145,10 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = nullptr,
+        .gmem_a = a.data_ptr(),
+        .stride_a = stride_a_elems,
+        .gmem_sfa = sfa.data_ptr(),
+        .stride_sfa = stride_sfa_elems,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -181,6 +197,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -210,6 +228,10 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = m_indices.data_ptr(),
+        .gmem_a = a.data_ptr(),
+        .stride_a = stride_a_elems,
+        .gmem_sfa = sfa.data_ptr(),
+        .stride_sfa = stride_sfa_elems,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -248,6 +270,8 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(get_non_contiguous_dim(major_a)));
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -277,6 +301,10 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = masked_m.data_ptr(),
+        .gmem_a = a.data_ptr(),
+        .stride_a = stride_a_elems,
+        .gmem_sfa = sfa.data_ptr(),
+        .stride_sfa = stride_sfa_elems,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -313,6 +341,10 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    // For BMM: a shape is [batch_size, m, k], stride along m-dim = k (fp8 elements)
+    const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(1));
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
+
     const int load_block_m = config.storage_config.load_block_m;
     const auto tensor_map_a = make_tma_3d_desc(a, k, m, batch_size,
                                                config.layout.block_k, load_block_m, 1,
@@ -348,6 +380,10 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = nullptr,
+        .gmem_a = a.data_ptr(),
+        .stride_a = stride_a_elems,
+        .gmem_sfa = sfa.data_ptr(),
+        .stride_sfa = stride_sfa_elems,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,

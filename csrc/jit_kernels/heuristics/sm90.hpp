@@ -60,11 +60,12 @@ struct SM90ArchSpec {
         const int block_k = 128 / get_element_size(desc.get_mma_kind());
 
         // Disable multicast for performance
-        const bool disable_multicast =
-            // The number of k-groups is large (a heuristic)
-            (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
-            // Not supported
-            (desc.gemm_type == GemmType::Batched);
+        // const bool disable_multicast =
+        //     // The number of k-groups is large (a heuristic)
+        //     (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
+        //     // Not supported
+        //     (desc.gemm_type == GemmType::Batched);
+        const bool disable_multicast = true;
 
         // Enumerate all candidates
         std::vector<Layout> candidates;
@@ -132,6 +133,7 @@ struct SM90ArchSpec {
         // Decide swizzling by the inner dim
         const auto swizzle_mode_a = get_swizzle_mode(
             desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m, c10::elementSize(desc.a_dtype));
+        // const auto swizzle_mode_a = 0;
         const auto swizzle_mode_b = get_swizzle_mode(
             desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n, c10::elementSize(desc.b_dtype));
         // We only enable swizzling for non-FP32 outputs
@@ -153,7 +155,7 @@ struct SM90ArchSpec {
         // NOTES: 1024 is for TMA swizzling alignment requirement
         const int smem_cd =
             align(layout.block_m * layout.block_n * static_cast<int>(c10::elementSize(desc.cd_dtype)), 1024);
-        const int smem_barriers = kNumMaxStages * 8 * 2;
+        const int smem_barriers = kNumMaxStages * 8 * 3;
 
         // Calculate A/B per stages
         const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
@@ -187,8 +189,10 @@ struct SM90ArchSpec {
     }
 
     static LaunchConfig get_launch_config(const GemmDesc& desc, const Layout& layout) {
-        const int num_tma_threads = 128;
+        const int num_tma_threads = 256;
         const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
+        // const int num_math_threads = 128;
+        printf("num_tma_threads: %d, num_math_threads: %d\n", num_tma_threads, num_math_threads);
         return {
             desc.num_sms,
             layout.get_cluster_size(),

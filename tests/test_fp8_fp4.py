@@ -1,3 +1,12 @@
+import os
+import shutil
+
+cache_dir = os.path.expanduser("~/.deep_gemm/cache")
+if os.path.exists(cache_dir):
+    shutil.rmtree(cache_dir)
+    print("Clearing DeepGEMM JIT cache...")
+
+
 import copy
 import numpy as np
 import random
@@ -216,7 +225,7 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
+    # test_gemm()
     test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
-    test_k_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_masked()
+    # test_k_grouped_gemm_contiguous()

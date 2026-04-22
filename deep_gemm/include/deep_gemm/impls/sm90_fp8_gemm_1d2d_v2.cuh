@@ -313,12 +313,17 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 // Only one elected thread issues TMA; the TMA descriptor will trigger
                 // full_b to arrive_and_expect_tx when data lands in smem
                 if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
+                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_b,
+                             smem_sfa[stage_idx],
+                             m_block_idx * BLOCK_M,
+                             scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx),
+                             num_tma_multicast_a);
                     tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_b,
                              smem_b[stage_idx],
                              k_idx,
                              scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                              num_tma_multicast_b, batch_idx);
-                    full_b.arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
+                    full_b.arrive_and_expect_tx(SMEM_SFA_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
                     // NOTE: No printf here — TMA WG only has 24 registers (warpgroup_reg_dealloc),
                     //       not enough for printf/vfprintf_internal which needs ~30-50 registers.
                 }
@@ -360,18 +365,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     const uint32_t col = linear % BLOCK_K;
                     cp_async4(dst_a + row * BLOCK_K + (col ^ ((row % 8) * 16)),
                               gmem_a + (m_global_base + row) * stride_a + k_idx + col);
-                }
-                if (tid_in_cpasync_wg < BLOCK_M) {
-                    if (m_global_base + tid_in_cpasync_wg < shape_m) {
-                            const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
-                            float* dst_sfa = smem_sfa[stage_idx] + tid_in_cpasync_wg;
-                            const float* src_sfa = gmem_sfa + sfa_k_idx * stride_sfa + (m_global_base + tid_in_cpasync_wg);
-                            asm volatile(
-                                "cp.async.ca.shared.global [%0], [%1], %2;\n"
-                                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
-                                   "l"(reinterpret_cast<const void*>(src_sfa)),
-                                   "n"(4));
-                        }
                 }
 
                 // Commit and wait for all cp.async in this group to complete

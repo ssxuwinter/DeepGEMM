@@ -362,16 +362,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                               gmem_a + (m_global_base + row) * stride_a + k_idx + col);
                 }
                 if (tid_in_cpasync_wg < BLOCK_M) {
-                    if (m_global_base + tid_in_cpasync_wg < shape_m) {
-                            const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
-                            float* dst_sfa = smem_sfa[stage_idx] + tid_in_cpasync_wg;
-                            const float* src_sfa = gmem_sfa + sfa_k_idx * stride_sfa + (m_global_base + tid_in_cpasync_wg);
-                            asm volatile(
-                                "cp.async.ca.shared.global [%0], [%1], %2;\n"
-                                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
-                                   "l"(reinterpret_cast<const void*>(src_sfa)),
-                                   "n"(4));
-                        }
+                    const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
+                    float* dst_sfa = smem_sfa[stage_idx] + tid_in_cpasync_wg;
+                    const float* src_sfa = gmem_sfa + (m_global_base + tid_in_cpasync_wg) * stride_sfa + sfa_k_idx;
+                    asm volatile(
+                        "cp.async.ca.shared.global [%0], [%1], %2;\n"
+                        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
+                            "l"(reinterpret_cast<const void*>(src_sfa)),
+                            "n"(4));
                 }
 
                 // Commit and wait for all cp.async in this group to complete
