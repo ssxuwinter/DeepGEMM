@@ -60,16 +60,16 @@ struct SM90ArchSpec {
         const int block_k = 128 / get_element_size(desc.get_mma_kind());
 
         // Disable multicast for performance
-        // const bool disable_multicast =
-        //     // The number of k-groups is large (a heuristic)
-        //     (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
-        //     // Not supported
-        //     (desc.gemm_type == GemmType::Batched);
-        const bool disable_multicast = true;
-
+        const bool disable_multicast =
+            // The number of k-groups is large (a heuristic)
+            (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
+            // Not supported
+            (desc.gemm_type == GemmType::Batched);
+        
+        const bool disable_multicast_on_A = desc.gemm_type == GemmType::MGroupedMasked or desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
         // Enumerate all candidates
         std::vector<Layout> candidates;
-        for (int cluster_m = 1; cluster_m <= (disable_multicast ? 1 : 2); ++ cluster_m) {
+        for (int cluster_m = 1; cluster_m <= (disable_multicast ? 1 : (disable_multicast_on_A ? 1 : 2)); ++ cluster_m) {
             for (int cluster_n = 1; cluster_n <= (disable_multicast ? 1 : 2); ++ cluster_n) {
                 // We only support cluster 2
                 if (cluster_m * cluster_n > 2)
