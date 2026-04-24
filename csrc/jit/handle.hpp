@@ -120,11 +120,10 @@ using KernelHandle = CUfunction;
 using LaunchConfigHandle = CUlaunchConfig;
 using LaunchAttrHandle = CUlaunchAttribute;
 
-// `cuLibraryEnumerateKernels` is supported since CUDA Driver API 12.4
+// `cuLibraryEnumerateKernels` is supported since CUDA Driver API 12.4,
+// but the compile-time CUDA_VERSION may exceed the runtime driver version.
+// Probe at runtime so we fall back gracefully on older drivers.
 #if CUDA_VERSION >= 12040
-    #define DG_JIT_USE_LIBRARY_ENUM_KERNELS
-    DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryGetKernelCount);
-    DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryEnumerateKernels);
     using LibraryHandle = CUlibrary;
 #else
     using LibraryHandle = CUmodule;
@@ -132,26 +131,49 @@ using LaunchAttrHandle = CUlaunchAttribute;
 
 #define DG_CUDA_UNIFIED_CHECK DG_CUDA_DRIVER_CHECK
 
+#if CUDA_VERSION >= 12040
+static bool driver_supports_library_enum() {
+    static int cached = -1;
+    if (cached < 0) {
+        void* sym = dlsym(get_driver_handle(), "cuLibraryEnumerateKernels");
+        cached = (sym != nullptr) ? 1 : 0;
+    }
+    return cached == 1;
+}
+#endif
+
 static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const std::string& func_name,
                                 LibraryHandle *library_opt = nullptr) {
     LibraryHandle library;
     KernelHandle kernel;
 
-#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
-    DG_CUDA_DRIVER_CHECK(lazy_cuLibraryLoadFromFile(&library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
-    unsigned int num_kernels;
-    DG_CUDA_DRIVER_CHECK(lazy_cuLibraryGetKernelCount(&num_kernels, library));
-    if (num_kernels != 1) {
-        const auto dir_path = cubin_path.parent_path();
-        printf("Corrupted JIT cache directory (expected 1 kernel, found %u): %s, "
-               "please run `rm -rf %s` and restart your task.\n",
-               num_kernels, dir_path.c_str(), dir_path.c_str());
-        DG_HOST_ASSERT(false and "Corrupted JIT cache directory");
-    }
+#if CUDA_VERSION >= 12040
+    if (driver_supports_library_enum()) {
+        DG_CUDA_DRIVER_CHECK(lazy_cuLibraryLoadFromFile(&library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+        unsigned int num_kernels;
+        auto pfn_count = reinterpret_cast<decltype(&cuLibraryGetKernelCount)>(dlsym(get_driver_handle(), "cuLibraryGetKernelCount"));
+        auto pfn_enum  = reinterpret_cast<decltype(&cuLibraryEnumerateKernels)>(dlsym(get_driver_handle(), "cuLibraryEnumerateKernels"));
+        DG_CUDA_DRIVER_CHECK(pfn_count(&num_kernels, library));
+        if (num_kernels != 1) {
+            const auto dir_path = cubin_path.parent_path();
+            printf("Corrupted JIT cache directory (expected 1 kernel, found %u): %s, "
+                   "please run `rm -rf %s` and restart your task.\n",
+                   num_kernels, dir_path.c_str(), dir_path.c_str());
+            DG_HOST_ASSERT(false and "Corrupted JIT cache directory");
+        }
 
-    CUkernel cu_kernel;
-    DG_CUDA_DRIVER_CHECK(lazy_cuLibraryEnumerateKernels(&cu_kernel, 1, library));
-    DG_CUDA_DRIVER_CHECK(lazy_cuKernelGetFunction(&kernel, cu_kernel));
+        CUkernel cu_kernel;
+        DG_CUDA_DRIVER_CHECK(pfn_enum(&cu_kernel, 1, library));
+        DG_CUDA_DRIVER_CHECK(lazy_cuKernelGetFunction(&kernel, cu_kernel));
+    } else {
+        CUmodule module;
+        DG_CUDA_DRIVER_CHECK(lazy_cuModuleLoad(&module, cubin_path.c_str()));
+        DG_CUDA_DRIVER_CHECK(lazy_cuModuleGetFunction(&kernel, module, func_name.c_str()));
+        if (library_opt != nullptr) {
+            *library_opt = reinterpret_cast<LibraryHandle>(module);
+            return kernel;
+        }
+    }
 #else
     DG_CUDA_DRIVER_CHECK(lazy_cuModuleLoad(&library, cubin_path.c_str()));
     DG_CUDA_DRIVER_CHECK(lazy_cuModuleGetFunction(&kernel, library, func_name.c_str()));
@@ -163,8 +185,13 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
 }
 
 static void unload_library(const LibraryHandle& library) {
-#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
-    const auto error = lazy_cuLibraryUnload(library);
+#if CUDA_VERSION >= 12040
+    CUresult error;
+    if (driver_supports_library_enum()) {
+        error = lazy_cuLibraryUnload(library);
+    } else {
+        error = lazy_cuModuleUnload(reinterpret_cast<CUmodule>(library));
+    }
 #else
     const auto error = lazy_cuModuleUnload(library);
 #endif

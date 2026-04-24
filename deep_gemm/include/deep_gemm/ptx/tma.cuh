@@ -31,6 +31,17 @@ CUTLASS_DEVICE void tensor_map_replace_global_inner_dim_stride_in_smem(cute::Tma
 #endif
 }
 
+/// cp.async → mbarrier arrive (non-blocking async notification)
+/// `.noinc` variant: each call decrements pending count by 1 when all prior cp.async
+/// from the executing thread complete. Init barrier count = number of arriving threads.
+CUTLASS_DEVICE void cp_async_mbarrier_arrive_noinc(
+    cutlass::arch::ClusterTransactionBarrier* ptr) {
+    asm volatile(
+        "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr)))
+        : "memory");
+}
+
 /// TMA instructions
 CUTLASS_DEVICE void mbarrier_arrive(
     cutlass::arch::ClusterTransactionBarrier* ptr) {

@@ -17,6 +17,7 @@
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/scheduler/gemm.cuh>
@@ -53,9 +54,8 @@ CUTLASS_DEVICE void dispatch_num_former_iters(uint32_t num_former_iters, const f
 //   DG_DBG_BLOCK_ID     : only this blockIdx.x prints  (default 0)
 //   DG_DBG_MAX_STAGES   : only stage < this value prints  (default 2)
 //   DG_DBG_PRINT_TID    : which threadIdx.x inside each WG is the "reporter"
-//                         TMA WG reporter  = kNumMathThreads + DG_DBG_PRINT_TID  (default 0)
-//                         CPA WG reporter  = kNumMathThreads + 128 + DG_DBG_PRINT_TID
-//                         Math WG reporter = DG_DBG_PRINT_TID
+//                         Producer WG reporter = kNumMathThreads + DG_DBG_PRINT_TID  (default 0)
+//                         Math WG reporter     = DG_DBG_PRINT_TID
 //
 // Net effect: at most (DG_DBG_MAX_STAGES * <num_print_sites>) lines per run —
 // easily fits in the 1 MB CUDA printf buffer.
@@ -209,9 +209,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Fill barriers
     // Layout: [full_barriers_b(0..kNumStages-1)] [full_barriers_a(kNumStages..2*kNumStages-1)] [empty_barriers(2*kNumStages..3*kNumStages-1)]
-    // full_barriers_b: produced by TMA WG (B + sfa)
-    // full_barriers_a: produced by cp.async WG (A)
-    // empty_barriers:  signaled by Math WG after consuming
+    // Single producer WG (128 threads) now owns both TMA and cp.async:
+    //   full_barriers_b: produced by one elected thread of a rotating warp via TMA (B only)
+    //   full_barriers_a: produced by all 128 threads via cp.async.mbarrier.arrive.noinc (A + sfa)
+    //   empty_barriers:  signaled by Math WG after consuming
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_sfb) + smem_sfb_size);
     auto full_barriers_b   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto full_barriers_a   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
@@ -246,8 +247,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // even with TMA multicast disabled, we want to make the behavior aligned
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            full_barriers_b[i]->init(1);  // TMA WG is sole producer for B + sfa
-            full_barriers_a[i]->init(1);  // cp.async WG is sole producer for A
+            full_barriers_b[i]->init(1);    // one elected thread (rotating warp) issues TMA for B
+            full_barriers_a[i]->init(128);  // all 128 producer-WG threads arrive via cp.async.mbarrier.arrive.noinc
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
@@ -259,9 +260,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
     // Register reconfigurations
-    constexpr uint32_t kNumTMARegisters      = 24;   // TMA WG: lightweight, only issues TMA
-    constexpr uint32_t kNumCpAsyncRegisters  = 40;   // cp.async WG: needs address arithmetic
-    constexpr uint32_t kNumMathRegisters     = kNumMathThreads == 128 ? 248 : 216;
+    // Producer WG (merged TMA + cp.async): needs address arithmetic for cp.async A/sfa
+    // plus a single elected thread per k-tile issuing TMA B → 40 regs fits both.
+    constexpr uint32_t kNumProducerRegisters = 40;
+    constexpr uint32_t kNumMathRegisters     = kNumMathThreads == 128 ? 248 : 232;
 
     static constexpr uint32_t kCpAsyncWidth   = 16;
     static constexpr uint32_t kCpAsyncThreads = 128;
@@ -287,15 +289,32 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     };
 
     // -------------------------------------------------------------------------
-    // TMA WG: threadIdx.x in [kNumMathThreads, kNumMathThreads + 127]
-    //         warp_idx in [kNumMathThreads/32, kNumMathThreads/32 + 3]
-    // Responsible for: loading B and sfa via TMA, signaling full_barriers_b
+    // Producer WG (merged TMA + cp.async, 128 threads, 4 warps):
+    //   threadIdx.x in [kNumMathThreads, kNumMathThreads + 127]
+    //   warp_idx    in [kNumMathThreads/32, kNumMathThreads/32 + 3]
+    //
+    // Per k-tile responsibilities:
+    //   (1) One elected thread of a rotating warp issues TMA for B.
+    //       The TMA-issuing warp is `warp_in_wg = k_block_idx % 4`, so warp 0 issues
+    //       the first k-tile's TMA, warp 1 the second, warp 2 the third, warp 3 the
+    //       fourth, and then wraps around. This spreads TMA-descriptor work across warps
+    //       and keeps each warp's register pressure uniform.
+    //   (2) All 128 threads issue cp.async for A (with swizzle-128B layout); threads
+    //       with tid_in_wg < BLOCK_M additionally issue cp.async for sfa.
+    //   (3) All 128 threads call cp.async.mbarrier.arrive.noinc on full_barriers_a.
+    //       The hardware decrements the arrive count for each thread once that thread's
+    //       prior cp.async ops complete, so the producer never has to block on
+    //       cp.async.wait_group — it proceeds straight to the next stage's empty-wait.
     // -------------------------------------------------------------------------
     if (warp_idx >= kNumMathThreads / 32 and warp_idx < kNumMathThreads / 32 + 4) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+        cutlass::arch::warpgroup_reg_dealloc<kNumProducerRegisters>();
+
+        const uint32_t tid_in_wg   = threadIdx.x - kNumMathThreads;            // [0, 128)
+        const uint32_t warp_in_wg  = warp_idx - kNumMathThreads / 32;          // [0, 4)
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
+            const uint32_t m_global_base = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
                 const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
@@ -310,80 +329,73 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 const uint32_t k_idx        = k_block_idx * BLOCK_K;
                 auto& full_b = *full_barriers_b[stage_idx];
 
-                // Only one elected thread issues TMA; the TMA descriptor will trigger
-                // full_b to arrive_and_expect_tx when data lands in smem
-                if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
+                // (1) Rotating-warp TMA: only the warp whose index within the WG matches
+                //     (k_block_idx % 4) issues TMA for B. Within that warp, elect_one_sync
+                //     picks a single thread. full_barriers_b has init count = 1, matching
+                //     the single arrive_and_expect_tx below.
+                const uint32_t tma_warp = k_block_idx & 3u;  // == k_block_idx % 4
+                if (warp_in_wg == tma_warp and cute::elect_one_sync()) {
                     tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_b,
                              smem_b[stage_idx],
                              k_idx,
                              scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                              num_tma_multicast_b, batch_idx);
                     full_b.arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
-                    // NOTE: No printf here — TMA WG only has 24 registers (warpgroup_reg_dealloc),
+                    // NOTE: No printf here — producer WG only has 40 registers (warpgroup_reg_dealloc),
                     //       not enough for printf/vfprintf_internal which needs ~30-50 registers.
                 }
-            }
-            // To safely deconstruct distributed shared barriers, we need another round of empty waits
-            if constexpr (kNumTMAMulticast > 1) {
-                for (uint32_t i = 0; i < kNumStages; advance_pipeline(i))
-                    empty_barriers[stage_idx]->wait(phase ^ 1);
-            }
-        }
 
-    // -------------------------------------------------------------------------
-    // cp.async WG: threadIdx.x in [kNumMathThreads + 128, kNumMathThreads + 255]
-    //              warp_idx in [kNumMathThreads/32 + 4, kNumMathThreads/32 + 7]
-    // Responsible for: loading A via cp.async with swizzle-128B, signaling full_barriers_a
-    // -------------------------------------------------------------------------
-    } else if (warp_idx >= kNumMathThreads / 32 + 4) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumCpAsyncRegisters>();
-
-        const uint32_t tid_in_cpasync_wg = threadIdx.x - kNumMathThreads - 128;
-
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
-            const uint32_t m_global_base = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
-            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait for Math WG to finish consuming this stage
-                empty_barriers[stage_idx]->wait(phase ^ 1);
-
-                const uint32_t k_idx = k_block_idx * BLOCK_K;
+                // (2a) All 128 threads load A via cp.async with swizzle-128B layout.
+                //      Each 16B cp.async covers one contiguous chunk; swizzle col XOR (row%8)*16
+                //      to match the WGMMA layout_type=1 (B128 swizzle) descriptor.
+                //
+                // Iter-major (row-group) mapping:
+                //      linear = (i * 128 + tid_in_wg) * 16
+                //   => 8 consecutive lanes in a warp cover one full 128B row (all 8 cols),
+                //      and each warp covers 4 consecutive rows per iter. The HW coalesces
+                //      the 32-lane requests into 4 x 128B cache-line fetches per warp-iter
+                //      (fully-utilized transactions), vs. the naive tid-major mapping which
+                //      scatters across 16 cache lines per warp-iter and relies on L2 reuse
+                //      across iters.
+                //
+                //   Row covered per iter (across all 128 threads): kRowsPerIter = 128 / 8 = 16.
+                //   Over kAItersPerThread = BLOCK_M / 16 iters, rows [0, BLOCK_M) are covered
+                //   exactly once — verified for BLOCK_M ∈ {16, 32, 64, 128, 256}.
                 __nv_fp8_e4m3* dst_a = smem_a[stage_idx];
-
-                // Load A tile with swizzle-128B layout
-                // Each 16B cp.async covers one contiguous chunk; we swizzle col XOR (row%8)*16
-                // to match the WGMMA layout_type=1 (B128 swizzle) descriptor
                 #pragma unroll
                 for (uint32_t i = 0; i < kAItersPerThread; ++i) {
-                    const uint32_t linear = (tid_in_cpasync_wg * kAItersPerThread + i) * kCpAsyncWidth;
+                    const uint32_t linear = (i * kCpAsyncThreads + tid_in_wg) * kCpAsyncWidth;
                     const uint32_t row = linear / BLOCK_K;
                     const uint32_t col = linear % BLOCK_K;
                     cp_async4(dst_a + row * BLOCK_K + (col ^ ((row % 8) * 16)),
                               gmem_a + (m_global_base + row) * stride_a + k_idx + col);
                 }
-                if (tid_in_cpasync_wg < BLOCK_M) {
-                    if (m_global_base + tid_in_cpasync_wg < shape_m) {
-                            const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
-                            float* dst_sfa = smem_sfa[stage_idx] + tid_in_cpasync_wg;
-                            const float* src_sfa = gmem_sfa + sfa_k_idx * stride_sfa + (m_global_base + tid_in_cpasync_wg);
-                            asm volatile(
-                                "cp.async.ca.shared.global [%0], [%1], %2;\n"
-                                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
-                                   "l"(reinterpret_cast<const void*>(src_sfa)),
-                                   "n"(4));
-                        }
+
+                // (2b) Threads with tid_in_wg < BLOCK_M also load one sfa element.
+                //      Out-of-range rows (m_global_base + tid >= shape_m) skip the copy but
+                //      still participate in the barrier arrival below — they simply have no
+                //      outstanding sfa cp.async, which is fine for cp.async.mbarrier.arrive.noinc.
+                if (tid_in_wg < BLOCK_M) {
+                    if (m_global_base + tid_in_wg < shape_m) {
+                        const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
+                        float* dst_sfa = smem_sfa[stage_idx] + tid_in_wg;
+                        const float* src_sfa = gmem_sfa + sfa_k_idx * stride_sfa + (m_global_base + tid_in_wg);
+                        asm volatile(
+                            "cp.async.ca.shared.global [%0], [%1], %2;\n"
+                            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
+                               "l"(reinterpret_cast<const void*>(src_sfa)),
+                               "n"(4));
+                    }
                 }
 
-                // Commit and wait for all cp.async in this group to complete
+                // (3) Commit this stage's cp.async group and asynchronously arrive on
+                //     full_barriers_a. All 128 threads call cp.async.mbarrier.arrive.noinc
+                //     (barrier init count = 128); each thread's arrive is deferred by HW
+                //     until that thread's prior cp.async ops complete. The producer never
+                //     blocks on cp.async.wait_group — it proceeds straight to the next
+                //     stage's empty-wait (real async pipelining).
                 asm volatile("cp.async.commit_group;\n" ::: "memory");
-                asm volatile("cp.async.wait_group 0;\n"  ::: "memory");
-                cutlass::arch::NamedBarrier::sync(128, 2);
-                // One thread signals that A is ready for this stage
-                if (tid_in_cpasync_wg == 0) {
-                    full_barriers_a[stage_idx]->arrive();
-                    // NOTE: No printf here — cp.async WG only has 40 registers (warpgroup_reg_dealloc),
-                    //       not enough for printf/vfprintf_internal which needs ~30-50 registers.
-                }
+                ptx::cp_async_mbarrier_arrive_noinc(full_barriers_a[stage_idx]);
             }
             // To safely deconstruct distributed shared barriers, we need another round of empty waits
             if constexpr (kNumTMAMulticast > 1) {
@@ -470,7 +482,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         if constexpr (not kMustUseUniformedScaleB)
                             scale_b_1 = ptx::ld_shared(smem_sfb + k_block_idx + shape_k_scales);
 
-                        // Wait B+sfa (TMA WG) and A (cp.async WG) ready
+                        // Wait for producer WG: B ready (TMA) and A + sfa ready (cp.async)
                         full_barriers_b[stage_idx]->wait(phase);
                         DG_DBG_BARRIER("Math:full_b.pass ", stage_idx, full_barriers_b[stage_idx], phase, 0);
                         full_barriers_a[stage_idx]->wait(phase);

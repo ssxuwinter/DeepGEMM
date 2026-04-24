@@ -189,7 +189,9 @@ struct SM90ArchSpec {
     }
 
     static LaunchConfig get_launch_config(const GemmDesc& desc, const Layout& layout) {
-        const int num_tma_threads = 256;
+        // Single producer WG (128 threads / 4 warps) issues both TMA (B) and cp.async (A + sfa).
+        // The TMA issuer rotates across the 4 warps per k-tile; all 128 threads participate in cp.async.
+        const int num_tma_threads = 128;
         const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
         // const int num_math_threads = 128;
         printf("num_tma_threads: %d, num_math_threads: %d\n", num_tma_threads, num_math_threads);
