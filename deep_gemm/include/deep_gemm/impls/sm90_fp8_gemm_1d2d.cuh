@@ -397,11 +397,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 asm volatile("cp.async.commit_group;\n" ::: "memory");
                 ptx::cp_async_mbarrier_arrive_noinc(full_barriers_a[stage_idx]);
             }
-            // To safely deconstruct distributed shared barriers, we need another round of empty waits
-            if constexpr (kNumTMAMulticast > 1) {
-                for (uint32_t i = 0; i < kNumStages; advance_pipeline(i))
-                    empty_barriers[stage_idx]->wait(phase ^ 1);
-            }
+        }
+
+        // To safely deconstruct distributed shared barriers, we need another round of empty waits
+        if constexpr (kNumTMAMulticast > 1) {
+            for (uint32_t i = 0; i < kNumStages; advance_pipeline(i))
+                empty_barriers[stage_idx]->wait(phase ^ 1);
         }
 
     } else {
