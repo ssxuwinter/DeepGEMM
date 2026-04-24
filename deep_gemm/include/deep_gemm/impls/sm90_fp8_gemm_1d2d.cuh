@@ -214,9 +214,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     //   full_barriers_a: produced by all 128 threads via cp.async.mbarrier.arrive.noinc (A + sfa)
     //   empty_barriers:  signaled by Math WG after consuming
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_sfb) + smem_sfb_size);
-    auto full_barriers_b   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
-    auto full_barriers_a   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
-    auto empty_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + 2 * kNumStages + i; });
+    // auto full_barriers_b   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
+    // auto full_barriers_a   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
+    auto full_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
+    auto empty_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + 1 * kNumStages + i; });
 
 #if DG_BARRIER_DEBUG
     // Diagnose SMEM layout: print offsets and total usage (block 0, thread 0 only).
@@ -247,8 +248,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // even with TMA multicast disabled, we want to make the behavior aligned
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            full_barriers_b[i]->init(1);    // one elected thread (rotating warp) issues TMA for B
-            full_barriers_a[i]->init(128);  // all 128 producer-WG threads arrive via cp.async.mbarrier.arrive.noinc
+            // full_barriers_b[i]->init(1);    // one elected thread (rotating warp) issues TMA for B
+            // full_barriers_a[i]->init(128);  // all 128 producer-WG threads arrive via cp.async.mbarrier.arrive.noinc
+            full_barriers[i]->init(129);
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
@@ -327,7 +329,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                 const uint32_t batch_idx    = (kIsBatchedMM ? scheduler.current_group_idx : 0);
                 const uint32_t k_idx        = k_block_idx * BLOCK_K;
-                auto& full_b = *full_barriers_b[stage_idx];
+                // auto& full_b = *full_barriers_b[stage_idx];
+                auto &full=*full_barriers[stage_idx];
 
                 // (1) Rotating-warp TMA: only the warp whose index within the WG matches
                 //     (k_block_idx % 4) issues TMA for B. Within that warp, elect_one_sync
@@ -335,12 +338,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 //     the single arrive_and_expect_tx below.
                 const uint32_t tma_warp = k_block_idx & 3u;  // == k_block_idx % 4
                 if (warp_in_wg == tma_warp and cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_b,
+                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full,
                              smem_b[stage_idx],
                              k_idx,
                              scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                              num_tma_multicast_b, batch_idx);
-                    full_b.arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
+                    full.arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
                     // NOTE: No printf here — producer WG only has 40 registers (warpgroup_reg_dealloc),
                     //       not enough for printf/vfprintf_internal which needs ~30-50 registers.
                 }
@@ -395,7 +398,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 //     blocks on cp.async.wait_group — it proceeds straight to the next
                 //     stage's empty-wait (real async pipelining).
                 asm volatile("cp.async.commit_group;\n" ::: "memory");
-                ptx::cp_async_mbarrier_arrive_noinc(full_barriers_a[stage_idx]);
+                ptx::cp_async_mbarrier_arrive_noinc(full_barriers[stage_idx]);
             }
         }
 
@@ -484,10 +487,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                             scale_b_1 = ptx::ld_shared(smem_sfb + k_block_idx + shape_k_scales);
 
                         // Wait for producer WG: B ready (TMA) and A + sfa ready (cp.async)
-                        full_barriers_b[stage_idx]->wait(phase);
-                        DG_DBG_BARRIER("Math:full_b.pass ", stage_idx, full_barriers_b[stage_idx], phase, 0);
-                        full_barriers_a[stage_idx]->wait(phase);
-                        DG_DBG_BARRIER("Math:full_a.pass ", stage_idx, full_barriers_a[stage_idx], phase, 0);
+                        // full_barriers_b[stage_idx]->wait(phase);
+                        // DG_DBG_BARRIER("Math:full_b.pass ", stage_idx, full_barriers_b[stage_idx], phase, 0);
+                        // full_barriers_a[stage_idx]->wait(phase);
+                        // DG_DBG_BARRIER("Math:full_a.pass ", stage_idx, full_barriers_a[stage_idx], phase, 0);
+                        full_barriers[stage_idx]->wait(phase);
+                        DG_DBG_BARRIER("Math:full.pass ", stage_idx, full_barriers[stage_idx], phase, 0);
 
                         // TODO: remove some useless computation for unaligned Ms
                         #pragma unroll
@@ -547,10 +552,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             } else {
                 #pragma unroll
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                    full_barriers_b[stage_idx]->wait(phase);
-                    DG_DBG_BARRIER("Math(skip):full_b", stage_idx, full_barriers_b[stage_idx], phase, 0);
-                    full_barriers_a[stage_idx]->wait(phase);
-                    DG_DBG_BARRIER("Math(skip):full_a", stage_idx, full_barriers_a[stage_idx], phase, 0);
+                    // full_barriers_b[stage_idx]->wait(phase);
+                    // DG_DBG_BARRIER("Math(skip):full_b", stage_idx, full_barriers_b[stage_idx], phase, 0);
+                    // full_barriers_a[stage_idx]->wait(phase);
+                    // DG_DBG_BARRIER("Math(skip):full_a", stage_idx, full_barriers_a[stage_idx], phase, 0);
+                    full_barriers[stage_idx]->wait(phase);
+                    DG_DBG_BARRIER("Math(skip):full", stage_idx, full_barriers[stage_idx], phase, 0);
                     empty_barrier_arrive();
                 }
             }
