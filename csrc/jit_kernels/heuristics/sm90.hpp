@@ -155,7 +155,7 @@ struct SM90ArchSpec {
         // NOTES: 1024 is for TMA swizzling alignment requirement
         const int smem_cd =
             align(layout.block_m * layout.block_n * static_cast<int>(c10::elementSize(desc.cd_dtype)), 1024);
-        const int smem_barriers = kNumMaxStages * 8 * 3;
+        const int smem_barriers = kNumMaxStages * 8 * 2;
 
         // Calculate A/B per stages
         const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
@@ -194,7 +194,6 @@ struct SM90ArchSpec {
         const int num_tma_threads = 128;
         const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
         // const int num_math_threads = 128;
-        printf("num_tma_threads: %d, num_math_threads: %d\n", num_tma_threads, num_math_threads);
         return {
             desc.num_sms,
             layout.get_cluster_size(),

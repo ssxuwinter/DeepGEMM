@@ -210,12 +210,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // Fill barriers
     // Layout: [full_barriers_b(0..kNumStages-1)] [full_barriers_a(kNumStages..2*kNumStages-1)] [empty_barriers(2*kNumStages..3*kNumStages-1)]
     // Single producer WG (128 threads) now owns both TMA and cp.async:
-    //   full_barriers_b: produced by one elected thread of a rotating warp via TMA (B only)
-    //   full_barriers_a: produced by all 128 threads via cp.async.mbarrier.arrive.noinc (A + sfa)
-    //   empty_barriers:  signaled by Math WG after consuming
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_sfb) + smem_sfb_size);
-    // auto full_barriers_b   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
-    // auto full_barriers_a   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
     auto full_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + 1 * kNumStages + i; });
 
@@ -248,8 +243,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // even with TMA multicast disabled, we want to make the behavior aligned
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            // full_barriers_b[i]->init(1);    // one elected thread (rotating warp) issues TMA for B
-            // full_barriers_a[i]->init(128);  // all 128 producer-WG threads arrive via cp.async.mbarrier.arrive.noinc
             full_barriers[i]->init(129);
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
@@ -487,10 +480,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                             scale_b_1 = ptx::ld_shared(smem_sfb + k_block_idx + shape_k_scales);
 
                         // Wait for producer WG: B ready (TMA) and A + sfa ready (cp.async)
-                        // full_barriers_b[stage_idx]->wait(phase);
-                        // DG_DBG_BARRIER("Math:full_b.pass ", stage_idx, full_barriers_b[stage_idx], phase, 0);
-                        // full_barriers_a[stage_idx]->wait(phase);
-                        // DG_DBG_BARRIER("Math:full_a.pass ", stage_idx, full_barriers_a[stage_idx], phase, 0);
                         full_barriers[stage_idx]->wait(phase);
                         DG_DBG_BARRIER("Math:full.pass ", stage_idx, full_barriers[stage_idx], phase, 0);
 
@@ -553,9 +542,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 #pragma unroll
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                     // full_barriers_b[stage_idx]->wait(phase);
-                    // DG_DBG_BARRIER("Math(skip):full_b", stage_idx, full_barriers_b[stage_idx], phase, 0);
-                    // full_barriers_a[stage_idx]->wait(phase);
-                    // DG_DBG_BARRIER("Math(skip):full_a", stage_idx, full_barriers_a[stage_idx], phase, 0);
                     full_barriers[stage_idx]->wait(phase);
                     DG_DBG_BARRIER("Math(skip):full", stage_idx, full_barriers[stage_idx], phase, 0);
                     empty_barrier_arrive();
