@@ -30,6 +30,12 @@ public:
         uint32_t stride_a;    // row stride of A in fp8 elements
         void *gmem_sfa;
         uint32_t stride_sfa;  // row stride of sfa in float elements (= M for MN-major)
+        void *gather_index;   // optional int32 row remap for A/sfa; nullptr keeps logical rows
+        // Per-rank ready-flag overlap (optional): set all three together. See
+        // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md for the contract.
+        void *rank_flags;     // (num_ranks,) int64 on device; nullptr disables overlap
+        void *tile_rank;      // (ceil(m/BLOCK_M),) int32 on device; nullptr disables overlap
+        uint32_t num_ranks;   // <= 8 (kNumRanksMax in kernel); 0 when overlap is off
         // TMA descriptors kept for reference (A/sfa currently unused in kernel)
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -80,6 +86,8 @@ static void __instantiate_kernel() {{
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.gmem_a, args.stride_a,
             args.gmem_sfa, args.stride_sfa,
+            args.gather_index,
+            args.rank_flags, args.tile_rank, args.num_ranks,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
     }
@@ -92,9 +100,43 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                const std::string& compiled_dims,
-                               const std::optional<std::string>& epilogue_type = std::nullopt) {
+                               const std::optional<std::string>& epilogue_type = std::nullopt,
+                               const std::optional<torch::Tensor>& gather_index = std::nullopt,
+                               // Per-rank ready-flag overlap, see
+                               // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
+                               // All three must be set together (else all unset).
+                               const std::optional<torch::Tensor>& rank_flags = std::nullopt,
+                               const std::optional<torch::Tensor>& tile_rank = std::nullopt,
+                               const std::optional<int>& num_ranks = std::nullopt) {
     DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    if (gather_index.has_value()) {
+        DG_HOST_ASSERT(gather_index->is_cuda() and gather_index->is_contiguous());
+        DG_HOST_ASSERT(gather_index->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(gather_index->numel() >= m);
+        // When gather_index is set, A may carry m_pool >= m rows from which the
+        // kernel will gather m logical output rows. SFA must already be
+        // transformed for the same m_pool (the caller passes the layout-
+        // transformed sfa whose stride(-1) reflects this).
+        DG_HOST_ASSERT(static_cast<int>(a.size(0)) >= m);
+    }
+    // Per-rank overlap: the three optional inputs must be coherent. Either all
+    // three are set (overlap enabled) or all unset (overlap disabled).
+    const bool has_overlap = rank_flags.has_value();
+    if (has_overlap) {
+        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value());
+        DG_HOST_ASSERT(gather_index.has_value() and "rank overlap requires gather_index");
+        DG_HOST_ASSERT(rank_flags->is_cuda() and rank_flags->is_contiguous());
+        DG_HOST_ASSERT(rank_flags->scalar_type() == torch::kLong);
+        DG_HOST_ASSERT(tile_rank->is_cuda() and tile_rank->is_contiguous());
+        DG_HOST_ASSERT(tile_rank->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(num_ranks.value() > 0 and num_ranks.value() <= 8);
+        DG_HOST_ASSERT(rank_flags->numel() >= num_ranks.value());
+        // tile_rank size check is deferred until BLOCK_M is known (after
+        // get_best_config below).
+    } else {
+        DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
+    }
 
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
@@ -112,9 +154,20 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
-    // cp.async path: raw pointer and stride
+    // Now that `BLOCK_M` is known, finish validating tile_rank for the rank-overlap path.
+    if (has_overlap) {
+        const int num_m_tiles = (m + config.layout.block_m - 1) / config.layout.block_m;
+        DG_HOST_ASSERT(tile_rank->numel() >= num_m_tiles);
+    }
+    // cp.async path: raw pointer and SFA stride (in elements).
+    // NOTE: read stride from the layout-transformed sfa instead of hard-coding
+    // `m`. After `transform_sf_into_required_layout` the SFA is MN-major with
+    // K-stride == `tma_aligned_size(mn, 4) = align(mn, 4)`. Using `sfa.stride(-1)`
+    // (a) handles `m % 4 != 0` correctly (would otherwise read padding garbage
+    // between SFA rows), and (b) supports gather where the caller passed an
+    // m_pool-row SFA.
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-1));
     // TMA descriptors (A/sfa kept for reference, currently unused in kernel)
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
@@ -149,6 +202,10 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .stride_a = stride_a_elems,
         .gmem_sfa = sfa.data_ptr(),
         .stride_sfa = stride_sfa_elems,
+        .gather_index = gather_index.has_value() ? gather_index->data_ptr() : nullptr,
+        .rank_flags = has_overlap ? rank_flags->data_ptr() : nullptr,
+        .tile_rank = has_overlap ? tile_rank->data_ptr() : nullptr,
+        .num_ranks = has_overlap ? static_cast<uint32_t>(num_ranks.value()) : 0u,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -167,9 +224,39 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                     const std::string& compiled_dims,
                                                     const bool& use_psum_layout,
-                                                    const std::optional<int>& expected_m_for_psum_layout) {
+                                                    const std::optional<int>& expected_m_for_psum_layout,
+                                                    const std::optional<torch::Tensor>& gather_index = std::nullopt,
+                                                    // Per-rank ready-flag overlap (optional). See
+                                                    // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
+                                                    const std::optional<torch::Tensor>& rank_flags = std::nullopt,
+                                                    const std::optional<torch::Tensor>& tile_rank = std::nullopt,
+                                                    const std::optional<int>& num_ranks = std::nullopt) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    if (gather_index.has_value()) {
+        DG_HOST_ASSERT(gather_index->is_cuda() and gather_index->is_contiguous());
+        DG_HOST_ASSERT(gather_index->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(gather_index->numel() >= m);
+        // For m-grouped contiguous + gather, A is the ORIGINAL (un-permuted) token
+        // pool shaped (m_pool, k); m_pool may differ from m (the grouped output
+        // row count). Caller is responsible for ensuring gather_index values
+        // stay within [0, m_pool).
+    }
+    // Per-rank overlap is only valid alongside gather_index. Same triple-validity
+    // contract as in `sm90_fp8_gemm_1d2d`.
+    const bool has_overlap = rank_flags.has_value();
+    if (has_overlap) {
+        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value());
+        DG_HOST_ASSERT(gather_index.has_value() and "rank overlap requires gather_index");
+        DG_HOST_ASSERT(rank_flags->is_cuda() and rank_flags->is_contiguous());
+        DG_HOST_ASSERT(rank_flags->scalar_type() == torch::kLong);
+        DG_HOST_ASSERT(tile_rank->is_cuda() and tile_rank->is_contiguous());
+        DG_HOST_ASSERT(tile_rank->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(num_ranks.value() > 0 and num_ranks.value() <= 8);
+        DG_HOST_ASSERT(rank_flags->numel() >= num_ranks.value());
+    } else {
+        DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
+    }
 
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
@@ -197,8 +284,14 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    if (has_overlap) {
+        const int num_m_tiles = (m + config.layout.block_m - 1) / config.layout.block_m;
+        DG_HOST_ASSERT(tile_rank->numel() >= num_m_tiles);
+    }
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
+    // Read SFA stride from the layout-transformed sfa tensor; see the comment in
+    // `sm90_fp8_gemm_1d2d` above for rationale (handles m % 4 != 0 + gather m_pool).
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-1));
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -232,6 +325,10 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .stride_a = stride_a_elems,
         .gmem_sfa = sfa.data_ptr(),
         .stride_sfa = stride_sfa_elems,
+        .gather_index = gather_index.has_value() ? gather_index->data_ptr() : nullptr,
+        .rank_flags = has_overlap ? rank_flags->data_ptr() : nullptr,
+        .tile_rank = has_overlap ? tile_rank->data_ptr() : nullptr,
+        .num_ranks = has_overlap ? static_cast<uint32_t>(num_ranks.value()) : 0u,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -305,6 +402,10 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .stride_a = stride_a_elems,
         .gmem_sfa = sfa.data_ptr(),
         .stride_sfa = stride_sfa_elems,
+        .gather_index = nullptr,
+        .rank_flags = nullptr,
+        .tile_rank = nullptr,
+        .num_ranks = 0u,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -384,6 +485,10 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .stride_a = stride_a_elems,
         .gmem_sfa = sfa.data_ptr(),
         .stride_sfa = stride_sfa_elems,
+        .gather_index = nullptr,
+        .rank_flags = nullptr,
+        .tile_rank = nullptr,
+        .num_ranks = 0u,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,

@@ -33,6 +33,33 @@ __device__ __forceinline__ void cp_async4(T* smem_ptr, const U* glob_ptr) {
     *smem_ptr = *reinterpret_cast<const T*>(glob_ptr);
 #endif
 }
+
+// Zero-fill variant of cp_async4: copies `src_size` bytes from global to smem and
+// zero-fills the rest of the 16-byte chunk in shared memory. When `src_size == 0`
+// the entire 16-byte smem region is zero-filled by hardware (no global read is
+// performed); the source pointer must still be a valid CUDA pointer (the HW
+// validates the address but does not dereference). This matches PTX semantics
+// for `cp.async.cg.shared.global ..., cp_size, src_size;` with `src_size <= cp_size`.
+//
+// Used for "pad rows" in the gather + per-rank-flag overlap path: rows whose
+// `gather_index[i] < 0` (or `logical_m >= shape_m`) translate to `src_size = 0`
+// here, so the corresponding smem A tile slice becomes all zeros and the math WG
+// naturally produces `A · B = 0` for those output rows.
+template <typename T, typename U>
+__device__ __forceinline__ void cp_async4_zfill(T* smem_ptr, const U* glob_ptr, uint32_t src_size) {
+#if __CUDACC_VER_MAJOR__ >= 11 && __CUDA_ARCH__ >= 800
+    const int BYTES = 16;
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "{ cp.async.cg.shared.global [%0], [%1], %2, %3; }\n"
+        :: "r"(smem), "l"((const void*)glob_ptr), "n"(BYTES), "r"(src_size));
+#else
+    if (src_size > 0)
+        *smem_ptr = *reinterpret_cast<const T*>(glob_ptr);
+    else
+        *smem_ptr = T{};
+#endif
+}
 namespace deep_gemm {
 
 template <uint32_t kNumFormerIters, uint32_t kGap, uint32_t kEnd, typename func_t>
@@ -139,6 +166,19 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t stride_a,          // row stride of A in fp8 elements
                         const float* __restrict__ gmem_sfa,
                         uint32_t stride_sfa,        // row stride of sfa in float elements (= M for MN-major)
+                        const int* __restrict__ gather_index,
+                        // Per-rank ready-flag overlap (optional). All three must be set together
+                        // (or all unset). See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
+                        //   rank_flags : (num_ranks,) int64 on global memory; bit set to 1 by the
+                        //                writer (e.g. all-gather kernel) once that rank's tokens
+                        //                are visible in `gmem_a`. Read with `ld.acquire.sys`.
+                        //   tile_rank  : (ceil(shape_m/BLOCK_M),) int32. Each entry is the unique
+                        //                rank that the corresponding M tile depends on (host
+                        //                guarantees that all non-pad rows in a tile share the rank).
+                        //   num_ranks  : runtime rank count, must satisfy `num_ranks <= 8`.
+                        const uint64_t* __restrict__ rank_flags,
+                        const int* __restrict__ tile_rank,
+                        uint32_t num_ranks,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
@@ -219,6 +259,18 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     auto full_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + 1 * kNumStages + i; });
 
+    // Per-rank "ready seen" cache for the gather + per-rank-flag overlap path.
+    // 8 entries (kNumRanksMax = 8 = NVL8 upper bound). Producer WG's elected
+    // thread spins on `rank_flags[r]` once per (CTA, rank) and writes 1 here on
+    // success; subsequent tiles from the same rank skip the spin via cache hit.
+    //
+    // Lives in dynamic smem after the barriers; the host's smem_size reservation
+    // for `kNumMaxStages * 8 * 3` barriers (see `get_pipeline_config` in
+    // sm90.hpp) leaves >256 B slack vs. the actual `2 * kNumStages` barriers we
+    // use, so 32 B for `s_rank_seen` fits without bumping `smem_size`.
+    static constexpr uint32_t kNumRanksMax = 8;
+    auto s_rank_seen = reinterpret_cast<uint32_t*>(barrier_start_ptr + 2 * kNumStages);
+
 #if DG_BARRIER_DEBUG
     // Diagnose SMEM layout: print offsets and total usage (block 0, thread 0 only).
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -254,6 +306,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
+        // Zero-init the per-rank "seen" cache. Only used when `rank_flags != nullptr`,
+        // but always cleared so the runtime check inside the producer loop is uniform.
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumRanksMax; ++ i)
+            s_rank_seen[i] = 0;
+
         // Make initialized barrier visible in async proxy
         cutlass::arch::fence_barrier_init();
     }
@@ -264,12 +322,13 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // Register reconfigurations
     // Producer WG (merged TMA + cp.async): needs address arithmetic for cp.async A/sfa
     // plus a single elected thread per k-tile issuing TMA B → 40 regs fits both.
-    constexpr uint32_t kNumProducerRegisters = 40;
-    constexpr uint32_t kNumMathRegisters     = kNumMathThreads == 128 ? 248 : 232;
+    constexpr uint32_t kNumProducerRegisters = 64;
+    constexpr uint32_t kNumMathRegisters     = kNumMathThreads == 128 ? 248 : 216;
 
     static constexpr uint32_t kCpAsyncWidth   = 16;
     static constexpr uint32_t kCpAsyncThreads = 128;
     static constexpr uint32_t kAItersPerThread = SMEM_A_SIZE_PER_STAGE / kCpAsyncThreads / kCpAsyncWidth;
+    static constexpr uint32_t kSFAItersPerThread = math::constexpr_ceil_div(BLOCK_M, kCpAsyncThreads);
     static_assert(kAItersPerThread >= 1,
                   "Not enough cp.async threads for A load");
     static_assert(SMEM_A_SIZE_PER_STAGE % (kCpAsyncThreads * kCpAsyncWidth) == 0,
@@ -301,8 +360,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     //       the first k-tile's TMA, warp 1 the second, warp 2 the third, warp 3 the
     //       fourth, and then wraps around. This spreads TMA-descriptor work across warps
     //       and keeps each warp's register pressure uniform.
-    //   (2) All 128 threads issue cp.async for A (with swizzle-128B layout); threads
-    //       with tid_in_wg < BLOCK_M additionally issue cp.async for sfa.
+    //   (2) All 128 threads issue cp.async for A (with swizzle-128B layout) and sfa.
     //   (3) All 128 threads call cp.async.mbarrier.arrive.noinc on full_barriers_a.
     //       The hardware decrements the arrive count for each thread once that thread's
     //       prior cp.async ops complete, so the producer never has to block on
@@ -313,10 +371,100 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
         const uint32_t tid_in_wg   = threadIdx.x - kNumMathThreads;            // [0, 128)
         const uint32_t warp_in_wg  = warp_idx - kNumMathThreads / 32;          // [0, 4)
+        const bool has_gather_index = gather_index != nullptr;
+        // Per-rank flag overlap is only active when the caller wired up all three
+        // tensors. Using the conjunction here lets the no-overlap path constant-fold
+        // out of the producer loop body.
+        const bool has_rank_flags = (rank_flags != nullptr) and (tile_rank != nullptr);
+
+        // `kPadSentinel == (uint32_t)-1` doubles as the natural cast result of
+        // `gather_index[i] = -1`, the "pad row" signal documented in
+        // sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md. We also force the
+        // sentinel for `logical_m >= shape_m` so the trailing partial tile
+        // can't issue out-of-bounds reads.
+        constexpr uint32_t kPadSentinel = 0xFFFFFFFFu;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
             const uint32_t m_global_base = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
+
+            // ----- Per-rank ready-flag wait (gather + overlap path only) -----
+            // Once per (CTA, rank). Elected lane in warp 0 spins on
+            // `rank_flags[r]` with system-scope acquire semantics. After it sees
+            // 1, it caches the result in `s_rank_seen[r]` (lives in dynamic smem,
+            // initialized to 0) and the rest of the producer WG is released by
+            // NamedBarrier::sync(2). Subsequent tiles for the same rank are
+            // free (cache hit, no spin, NamedBarrier-only).
+            //
+            // **Fence after barrier**: `ld.acquire.sys` only orders the elected
+            // thread's *own* subsequent loads. The other 127 producer-WG threads
+            // wake up from NamedBarrier::sync(2) but have no acquire of their
+            // own — and `bar.sync` is a CTA-scope memory fence, not a system-
+            // scope one. So we explicitly issue `membar.sys` after the barrier
+            // to lift the elected thread's acquire to a CTA-wide guarantee:
+            // every producer-WG thread now sees a system-coherent view of A_pool
+            // before issuing cp.async. Without this, ~5% of overlap-mode
+            // iterations on H800/CUDA-12.2 produced a tiny but consistent
+            // numerical drift (~1e-2) in the GEMM result.
+            if (has_rank_flags) {
+                if (warp_in_wg == 0 and cute::elect_one_sync()) {
+                    const uint32_t r = static_cast<uint32_t>(__ldg(tile_rank + m_block_idx));
+                    // Defensive bound check: corrupt `tile_rank` would otherwise scribble
+                    // past `s_rank_seen` and read garbage from `rank_flags`.
+                    DG_TRAP_ONLY_DEVICE_ASSERT(r < num_ranks and r < kNumRanksMax);
+                    if (s_rank_seen[r] == 0) {
+                        // Spin with `ld.acquire.sys`: pairs with a remote
+                        // `st.release.sys` (or fence + relaxed store) on the
+                        // writer side, so seeing flag = 1 also implies all of
+                        // that rank's writes to gmem_a are visible.
+                        while (deep_gemm::ptx::ld_acq_sys(rank_flags + r) == 0) {
+                            // Spin. The flag is monotonic 0 → 1 within a launch;
+                            // host is responsible for clearing between launches.
+                        }
+                        s_rank_seen[r] = 1;
+                    }
+                }
+                // Use a kernel-unique NamedBarrier id (0 and 1 are owned by the
+                // math WG); 2 is the first free slot.
+                cutlass::arch::NamedBarrier::sync(kCpAsyncThreads, 2);
+                // Promote the elected thread's `ld.acquire.sys` to a system-
+                // scope fence visible to every producer-WG thread (see comment
+                // block above for rationale).
+                asm volatile("membar.sys;" ::: "memory");
+            }
+            // -----------------------------------------------------------------
+
+            uint32_t source_m_for_a[kAItersPerThread];
+            #pragma unroll
+            for (uint32_t i = 0; i < kAItersPerThread; ++i) {
+                const uint32_t linear = (i * kCpAsyncThreads + tid_in_wg) * kCpAsyncWidth;
+                const uint32_t row = linear / BLOCK_K;
+                const uint32_t logical_m = m_global_base + row;
+                if (logical_m >= shape_m) {
+                    source_m_for_a[i] = kPadSentinel;
+                } else if (has_gather_index) {
+                    const int g = __ldg(gather_index + logical_m);
+                    // Any negative value (host convention is `-1`) means "pad row".
+                    source_m_for_a[i] = (g < 0) ? kPadSentinel : static_cast<uint32_t>(g);
+                } else {
+                    source_m_for_a[i] = logical_m;
+                }
+            }
+            uint32_t source_m_for_sfa[kSFAItersPerThread];
+            #pragma unroll
+            for (uint32_t i = 0; i < kSFAItersPerThread; ++i) {
+                const uint32_t row = i * kCpAsyncThreads + tid_in_wg;
+                const uint32_t logical_m = m_global_base + row;
+                if (row >= BLOCK_M or logical_m >= shape_m) {
+                    source_m_for_sfa[i] = kPadSentinel;
+                } else if (has_gather_index) {
+                    const int g = __ldg(gather_index + logical_m);
+                    source_m_for_sfa[i] = (g < 0) ? kPadSentinel : static_cast<uint32_t>(g);
+                } else {
+                    source_m_for_sfa[i] = logical_m;
+                }
+            }
+
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
                 const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
@@ -370,24 +518,51 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     const uint32_t linear = (i * kCpAsyncThreads + tid_in_wg) * kCpAsyncWidth;
                     const uint32_t row = linear / BLOCK_K;
                     const uint32_t col = linear % BLOCK_K;
-                    cp_async4(dst_a + row * BLOCK_K + (col ^ ((row % 8) * 16)),
-                              gmem_a + (m_global_base + row) * stride_a + k_idx + col);
+                    // Pad-aware cp.async: when `source_m_for_a[i] == kPadSentinel` the row is
+                    // either out-of-shape_m or explicitly tagged by the host as pad
+                    // (`gather_index[i] < 0`). Pass `src_size = 0` to make HW zero-fill the
+                    // 16 B smem slot without dereferencing `src`. We still need a valid
+                    // (in-bounds) source pointer to satisfy the address generator, so we
+                    // fall back to `gmem_a` itself for pad rows.
+                    const bool is_pad = (source_m_for_a[i] == kPadSentinel);
+                    const uint32_t src_size = is_pad ? 0u : kCpAsyncWidth;
+                    const __nv_fp8_e4m3* src_a = is_pad
+                        ? gmem_a
+                        : gmem_a + source_m_for_a[i] * stride_a + k_idx + col;
+                    cp_async4_zfill(dst_a + row * BLOCK_K + (col ^ ((row % 8) * 16)),
+                                    src_a, src_size);
                 }
 
-                // (2b) Threads with tid_in_wg < BLOCK_M also load one sfa element.
-                //      Out-of-range rows (m_global_base + tid >= shape_m) skip the copy but
-                //      still participate in the barrier arrival below — they simply have no
-                //      outstanding sfa cp.async, which is fine for cp.async.mbarrier.arrive.noinc.
-                if (tid_in_wg < BLOCK_M) {
-                    if (m_global_base + tid_in_wg < shape_m) {
+                // (2b) Threads cooperatively load sfa rows; each thread may cover multiple
+                //      rows when BLOCK_M > 128.
+                //
+                //      Pad-aware: rows with `source_m_for_sfa[i] == kPadSentinel` (either
+                //      out-of-shape_m or explicit `gather_index < 0`) issue a 4 B cp.async
+                //      with `src_size = 0`, letting HW zero-fill the smem slot (so that
+                //      `scale_a == 0` for that row → `A · B · scale = 0` in the math WG).
+                //      Fully past-tile rows (`row >= BLOCK_M`) skip the cp.async entirely.
+                //
+                //      Out-of-bound rows that are skipped still participate in
+                //      `cp.async.mbarrier.arrive.noinc` correctly: a thread with no
+                //      outstanding cp.async in this group resolves its arrive immediately.
+                #pragma unroll
+                for (uint32_t i = 0; i < kSFAItersPerThread; ++i) {
+                    const uint32_t row = i * kCpAsyncThreads + tid_in_wg;
+                    if (row < BLOCK_M) {
                         const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
-                        float* dst_sfa = smem_sfa[stage_idx] + tid_in_wg;
-                        const float* src_sfa = gmem_sfa + sfa_k_idx * stride_sfa + (m_global_base + tid_in_wg);
+                        const bool is_pad_sfa = (source_m_for_sfa[i] == kPadSentinel);
+                        const uint32_t src_size_sfa = is_pad_sfa ? 0u : 4u;
+                        float* dst_sfa = smem_sfa[stage_idx] + row;
+                        // For pad rows, fall back to `gmem_sfa` as a known-valid source
+                        // pointer; HW won't dereference it because src_size = 0.
+                        const float* src_sfa = is_pad_sfa
+                            ? gmem_sfa
+                            : gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i];
                         asm volatile(
-                            "cp.async.ca.shared.global [%0], [%1], %2;\n"
+                            "cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
                             :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
                                "l"(reinterpret_cast<const void*>(src_sfa)),
-                               "n"(4));
+                               "r"(src_size_sfa));
                     }
                 }
 

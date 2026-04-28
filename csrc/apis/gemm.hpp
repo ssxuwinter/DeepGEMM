@@ -55,7 +55,16 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             std::optional<std::tuple<int, int>> recipe_a,
                             std::optional<std::tuple<int, int>> recipe_b,
                             const std::string& compiled_dims,
-                            const bool& disable_ue8m0_cast) {
+                            const bool& disable_ue8m0_cast,
+                            const std::optional<torch::Tensor>& gather_index = std::nullopt,
+                            // Per-rank ready-flag overlap (optional). When supplied, the kernel
+                            // spins on `rank_flags[tile_rank[m_block_idx]]` (system-scope acquire
+                            // load) before computing each tile, and treats `gather_index[i] < 0`
+                            // as a "pad row" (zero-fill in smem; output row becomes 0).
+                            // See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
+                            const std::optional<torch::Tensor>& rank_flags = std::nullopt,
+                            const std::optional<torch::Tensor>& tile_rank = std::nullopt,
+                            const std::optional<int>& num_ranks = std::nullopt) {
     // Shape must be `[M, K] @ [N, K].T`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -69,11 +78,34 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
 
     // Type and shape checks
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
-    const auto [n , k_] = check_ab_fp8_fp4(b.first, major_b, arch_major);
-    const auto [m_, n_] = get_shape<2>(d);
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    const auto [m_a, k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [n  , k_] = check_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [m_d, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(n == n_ and k == k_);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    if (gather_index.has_value()) {
+        DG_HOST_ASSERT(gather_index->is_cuda() and gather_index->is_contiguous());
+        DG_HOST_ASSERT(gather_index->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(gather_index->numel() >= m_d);
+        // A may carry m_pool >= m_d rows; the kernel will gather m_d output
+        // rows out of that pool via gather_index.
+        DG_HOST_ASSERT(m_a >= m_d);
+    } else {
+        DG_HOST_ASSERT(m_a == m_d);
+    }
+    // Per-rank overlap requires gather_index. The 1d2d entry will do the deep
+    // checks (dtype, shape vs BLOCK_M, etc); here we only enforce coherence.
+    const bool has_overlap = rank_flags.has_value();
+    if (has_overlap) {
+        DG_HOST_ASSERT(gather_index.has_value() and "rank_flags requires gather_index");
+        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value());
+    } else {
+        DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
+    }
+    // SFA layout transform must reflect the actual A pool size, while the GEMM
+    // M dim is the output dim from D.
+    const int m_pool = m_a;
+    const int m = m_d;
 
     // Early return for trivial cases
     if (early_return(m, n, k, d, c))
@@ -81,18 +113,23 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
 
     // Transform SFA and SFB into compute-required layout
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+        a.second, b.second, m_pool, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
     // Dispatch into different implements
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
         if (gran_n == 1) {
+            DG_HOST_ASSERT(not gather_index.has_value());
+            DG_HOST_ASSERT(not has_overlap);
             sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
         } else {
             const auto major_sfb = get_major_type_ab(sfb);
-            sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+            sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims,
+                               std::nullopt, gather_index, rank_flags, tile_rank, num_ranks);
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_ASSERT(not gather_index.has_value());
+        DG_HOST_ASSERT(not has_overlap);
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims);
     } else {
@@ -150,7 +187,13 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const std::string& compiled_dims,
                                                  const bool& disable_ue8m0_cast,
                                                  const bool& use_psum_layout,
-                                                 const std::optional<int>& expected_m_for_psum_layout) {
+                                                 const std::optional<int>& expected_m_for_psum_layout,
+                                                 const std::optional<torch::Tensor>& gather_index = std::nullopt,
+                                                 // Per-rank ready-flag overlap (optional). See
+                                                 // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
+                                                 const std::optional<torch::Tensor>& rank_flags = std::nullopt,
+                                                 const std::optional<torch::Tensor>& tile_rank = std::nullopt,
+                                                 const std::optional<int>& num_ranks = std::nullopt) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -161,15 +204,35 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
 
     // Type and shape checks
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [m_a, k] = check_ab_fp8_fp4(a.first, major_a, arch_major);
     const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
-    const auto [m_, n_] = get_shape<2>(d);
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    const auto [m_d, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
+    if (gather_index.has_value()) {
+        DG_HOST_ASSERT(gather_index->is_cuda() and gather_index->is_contiguous());
+        DG_HOST_ASSERT(gather_index->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(gather_index->numel() >= m_d);
+        // A is a token pool of size m_a; m_d = grouped output rows.
+        // m_a is unconstrained relative to m_d (e.g. MoE top-k may have m_a < m_d).
+    } else {
+        DG_HOST_ASSERT(m_a == m_d);
+    }
+    // Per-rank overlap coherence (deep checks happen in the 1d2d entry).
+    const bool has_overlap = rank_flags.has_value();
+    if (has_overlap) {
+        DG_HOST_ASSERT(gather_index.has_value() and "rank_flags requires gather_index");
+        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value());
+    } else {
+        DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
+    }
+    const int m_pool = m_a;
+    const int m = m_d;
 
-    // Layout checks
+    // Layout checks: grouped_layout is the OUTPUT row → expert mapping (or
+    // per-group cumulative m for psum), independent of the A pool size.
     if (use_psum_layout) {
         const auto [num_groups_] = get_shape<1>(grouped_layout);
         DG_HOST_ASSERT(num_groups == num_groups_);
@@ -186,17 +249,21 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     if (m == 0)
         return;
 
-    // Transform SFA and SFB into compute-required layout
+    // Transform SFA and SFB into compute-required layout. SFA must match the A
+    // pool (m_pool rows), not the GEMM output m.
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
+        a.second, b.second, m_pool, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         const auto major_sfb = get_major_type_ab(sfb);
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
-                                                compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+                                                compiled_dims, use_psum_layout, expected_m_for_psum_layout,
+                                                gather_index, rank_flags, tile_rank, num_ranks);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_ASSERT(not gather_index.has_value());
+        DG_HOST_ASSERT(not has_overlap);
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, expected_m_for_psum_layout);
@@ -605,7 +672,11 @@ static void register_apis(pybind11::module_& m) {
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk",
-          py::arg("disable_ue8m0_cast") = false);
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("gather_index") = std::nullopt,
+          py::arg("rank_flags") = std::nullopt,
+          py::arg("tile_rank") = std::nullopt,
+          py::arg("num_ranks") = std::nullopt);
     m.def("fp8_fp4_gemm_nn", &fp8_fp4_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
@@ -631,7 +702,11 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
-          py::arg("expected_m_for_psum_layout") = std::nullopt);
+          py::arg("expected_m_for_psum_layout") = std::nullopt,
+          py::arg("gather_index") = std::nullopt,
+          py::arg("rank_flags") = std::nullopt,
+          py::arg("tile_rank") = std::nullopt,
+          py::arg("num_ranks") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,

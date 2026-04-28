@@ -194,7 +194,7 @@ struct SM90ArchSpec {
         const int num_tma_threads = 128;
         const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
         // const int num_math_threads = 128;
-        printf("num_tma_threads: %d, num_math_threads: %d\n", num_tma_threads, num_math_threads);
+        // printf("num_tma_threads: %d, num_math_threads: %d\n", num_tma_threads, num_math_threads);
         return {
             desc.num_sms,
             layout.get_cluster_size(),

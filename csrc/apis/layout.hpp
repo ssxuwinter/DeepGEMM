@@ -6,6 +6,7 @@
 
 #if DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/smxx_layout.hpp"
+#include "../jit_kernels/impls/moe_gather_layout.hpp"
 #endif
 
 namespace deep_gemm::layout {
@@ -127,6 +128,18 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);
     m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", &get_mn_major_tma_aligned_packed_ue8m0_tensor);
     m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", &get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor);
+
+    // Build (gather_index, tile_rank, grouped_layout, m_logical) from a global
+    // MoE routing-topk for the SM90 1d2d gather + per-rank-flag overlap path.
+    // See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md (§11) for the
+    // full layout contract.
+    m.def("build_gather_layout_for_rank_overlap", &build_gather_layout_for_rank_overlap,
+          py::arg("routing_topk"),
+          py::arg("local_rank"),
+          py::arg("num_ranks"),
+          py::arg("tokens_per_rank"),
+          py::arg("num_experts"),
+          py::arg("block_m"));
 #endif
 
     m.def("set_mk_alignment_for_contiguous_layout", [&](const int& new_value) {
