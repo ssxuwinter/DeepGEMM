@@ -18,7 +18,10 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
                                                                           std::tuple<int, int>>& recipe,
                                                        const std::optional<int>& num_groups,
                                                        const std::optional<bool>& is_sfa,
-                                                       const bool& disable_ue8m0_cast) {
+                                                       const bool& disable_ue8m0_cast,
+                                                       // When true, keep sfa as K-major row-major (overlap/all-to-all path).
+                                                       // When false (default), transpose sfa to MN-major for better coalescing.
+                                                       const bool& sfa_is_kmajor = false) {
     const auto arch_major = device_runtime->get_arch_major();
 
     // Get granularity MN/K from recipe
@@ -37,10 +40,13 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
-    // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast)) 
-        return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, false, torch::kFloat);
-        // return get_mn_major_tma_aligned_tensor(sf);
+    // (FP32, 1, 128) on SM90: when sfa_is_kmajor keep K-major (no transpose); otherwise transpose to MN-major for coalescing
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast)) {
+        if (sfa_is_kmajor)
+            return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, false, torch::kFloat);
+        else
+            return get_mn_major_tma_aligned_tensor(sf);
+    }
 
     // (FP32, 128, 128) on SM90: no need to transform, check SFB requirements
     if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
@@ -69,7 +75,9 @@ static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into
         const std::optional<std::tuple<int, int>>& recipe_b,
         const std::optional<int>& num_groups_a,
         const std::optional<int>& num_groups_b,
-        const bool& disable_ue8m0_cast = false) {
+        const bool& disable_ue8m0_cast = false,
+        // When true, keep sfa as K-major (no transpose). When false (default), transpose to MN-major.
+        const bool& sfa_is_kmajor = false) {
     // Use default recipe, if none is specified
     if (not recipe_a.has_value() and not recipe.has_value())
         recipe = get_default_recipe(sfa.scalar_type(), sfb.scalar_type());
@@ -79,8 +87,8 @@ static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into
     DG_HOST_ASSERT(recipe_a.has_value() != recipe.has_value());
 
     // Transform SFA and SFB layout
-    const auto transformed_sfa = recipe.has_value() ? transform_sf_into_required_layout(sfa, m, k, recipe.value(), num_groups_a, true, disable_ue8m0_cast)
-                                                    : transform_sf_into_required_layout(sfa, m, k, recipe_a.value(), num_groups_a, std::nullopt, disable_ue8m0_cast);
+    const auto transformed_sfa = recipe.has_value() ? transform_sf_into_required_layout(sfa, m, k, recipe.value(), num_groups_a, true, disable_ue8m0_cast, sfa_is_kmajor)
+                                                    : transform_sf_into_required_layout(sfa, m, k, recipe_a.value(), num_groups_a, std::nullopt, disable_ue8m0_cast, sfa_is_kmajor);
     const auto transformed_sfb = recipe.has_value() ? transform_sf_into_required_layout(sfb, n, k, recipe.value(), num_groups_b, false, disable_ue8m0_cast)
                                                     : transform_sf_into_required_layout(sfb, n, k, recipe_b.value(), num_groups_b, std::nullopt, disable_ue8m0_cast);
     const int gran_k_a = recipe_a.has_value() ? std::get<1>(recipe_a.value()) : std::get<2>(recipe.value());
@@ -123,7 +131,8 @@ static void register_apis(pybind11::module_& m) {
       py::arg("sf"), py::arg("mn"), py::arg("k"), py::arg("recipe"),
       py::arg("num_groups") = std::nullopt,
       py::arg("is_sfa") = std::nullopt,
-      py::arg("disable_ue8m0_cast") = false);
+      py::arg("disable_ue8m0_cast") = false,
+      py::arg("sfa_is_kmajor") = false);
 
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);

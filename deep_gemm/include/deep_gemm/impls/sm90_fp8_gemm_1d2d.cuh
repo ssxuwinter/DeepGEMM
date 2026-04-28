@@ -165,7 +165,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const __nv_fp8_e4m3* __restrict__ gmem_a,
                         uint32_t stride_a,          // row stride of A in fp8 elements
                         const float* __restrict__ gmem_sfa,
-                        uint32_t stride_sfa,        // row stride of sfa in float elements (= sf_k for K-major row-major)
+                        uint32_t stride_sfa,        // stride of sfa: sf_k for K-major, tma_aligned_m for MN-major
                         const int* __restrict__ gather_index,
                         // Per-rank ready-flag overlap (optional). All three must be set together
                         // (or all unset). See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
@@ -179,6 +179,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const uint64_t* __restrict__ rank_flags,
                         const int* __restrict__ tile_rank,
                         uint32_t num_ranks,
+                        // SFA memory layout:
+                        //   true  = K-major [m, sf_k]:  addr = row * stride_sfa + sfa_k_idx  (overlap path)
+                        //   false = MN-major [sf_k, m]: addr = sfa_k_idx * stride_sfa + row  (coalescing path)
+                        bool sfa_is_kmajor,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
@@ -557,8 +561,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         // pointer; HW won't dereference it because src_size = 0.
                         const float* src_sfa = is_pad_sfa
                             ? gmem_sfa
-                            // : gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i];
-                            : gmem_sfa + source_m_for_sfa[i] * stride_sfa + sfa_k_idx;
+                            : (sfa_is_kmajor
+                                // K-major [m, sf_k]: row-major, addr = row * stride_sfa + k_col
+                                ? gmem_sfa + source_m_for_sfa[i] * stride_sfa + sfa_k_idx
+                                // MN-major [sf_k, m]: transposed, addr = k_col * stride_sfa + row
+                                : gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i]);
                         asm volatile(
                             "cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
                             :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),

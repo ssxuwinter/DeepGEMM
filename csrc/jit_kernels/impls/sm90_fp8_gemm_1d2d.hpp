@@ -36,6 +36,7 @@ public:
         void *rank_flags;     // (num_ranks,) int64 on device; nullptr disables overlap
         void *tile_rank;      // (ceil(m/BLOCK_M),) int32 on device; nullptr disables overlap
         uint32_t num_ranks;   // <= 8 (kNumRanksMax in kernel); 0 when overlap is off
+        bool sfa_is_kmajor;   // true = K-major [m, sf_k] (overlap path); false = MN-major [sf_k, m] (coalescing)
         // TMA descriptors kept for reference (A/sfa currently unused in kernel)
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -88,6 +89,7 @@ static void __instantiate_kernel() {{
             args.gmem_sfa, args.stride_sfa,
             args.gather_index,
             args.rank_flags, args.tile_rank, args.num_ranks,
+            args.sfa_is_kmajor,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
     }
@@ -159,11 +161,20 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         const int num_m_tiles = (m + config.layout.block_m - 1) / config.layout.block_m;
         DG_HOST_ASSERT(tile_rank->numel() >= num_m_tiles);
     }
-    // cp.async path: SFA is row-major [m, sf_k] (K-major): stride = sf_k = sfa.stride(0) (or stride(-2) for 3D).
-    DG_HOST_ASSERT(sfa.stride(-1) == 1);
-    DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
+    // cp.async path: SFA layout depends on has_overlap (= sfa_is_kmajor).
+    // has_overlap=true  → K-major [m, sf_k]:   stride(-1)==1,  stride_sfa = sf_k.
+    // has_overlap=false → MN-major [sf_k, m]:  stride(-2)==1,  stride_sfa = tma_aligned_m.
+    uint32_t stride_sfa_elems;
+    if (has_overlap) {
+        DG_HOST_ASSERT(sfa.stride(-1) == 1);
+        DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
+        stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
+    } else {
+        DG_HOST_ASSERT(sfa.stride(-2) == 1);
+        DG_HOST_ASSERT(sfa.stride(-1) == sfa.size(-2));
+        stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-1));
+    }
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
     // TMA descriptors (A/sfa kept for reference, currently unused in kernel)
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
@@ -202,6 +213,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .rank_flags = has_overlap ? rank_flags->data_ptr() : nullptr,
         .tile_rank = has_overlap ? tile_rank->data_ptr() : nullptr,
         .num_ranks = has_overlap ? static_cast<uint32_t>(num_ranks.value()) : 0u,
+        .sfa_is_kmajor = has_overlap,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -284,10 +296,20 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         const int num_m_tiles = (m + config.layout.block_m - 1) / config.layout.block_m;
         DG_HOST_ASSERT(tile_rank->numel() >= num_m_tiles);
     }
-    DG_HOST_ASSERT(sfa.stride(-1) == 1);
-    DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
+    // cp.async path: SFA layout depends on has_overlap (= sfa_is_kmajor).
+    // has_overlap=true  → K-major [m, sf_k]:  stride(-1)==1,  stride_sfa = sf_k.
+    // has_overlap=false → MN-major [sf_k, m]: stride(-2)==1,  stride_sfa = tma_aligned_m.
+    uint32_t stride_sfa_elems;
+    if (has_overlap) {
+        DG_HOST_ASSERT(sfa.stride(-1) == 1);
+        DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
+        stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
+    } else {
+        DG_HOST_ASSERT(sfa.stride(-2) == 1);
+        DG_HOST_ASSERT(sfa.stride(-1) == sfa.size(-2));
+        stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-1));
+    }
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -325,6 +347,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .rank_flags = has_overlap ? rank_flags->data_ptr() : nullptr,
         .tile_rank = has_overlap ? tile_rank->data_ptr() : nullptr,
         .num_ranks = has_overlap ? static_cast<uint32_t>(num_ranks.value()) : 0u,
+        .sfa_is_kmajor = has_overlap,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,

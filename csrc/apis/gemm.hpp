@@ -111,9 +111,10 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     if (early_return(m, n, k, d, c))
         return;
 
-    // Transform SFA and SFB into compute-required layout
+    // Transform SFA and SFB into compute-required layout.
+    // When has_overlap, sfa stays K-major (no transpose); otherwise transpose to MN-major for coalescing.
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m_pool, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+        a.second, b.second, m_pool, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast, has_overlap);
 
     // Dispatch into different implements
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
@@ -251,8 +252,9 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
 
     // Transform SFA and SFB into compute-required layout. SFA must match the A
     // pool (m_pool rows), not the GEMM output m.
+    // When has_overlap, sfa stays K-major (no transpose); otherwise transpose to MN-major for coalescing.
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m_pool, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
+        a.second, b.second, m_pool, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast, has_overlap);
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
