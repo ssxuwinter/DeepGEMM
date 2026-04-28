@@ -29,7 +29,7 @@ public:
         void *gmem_a;
         uint32_t stride_a;    // row stride of A in fp8 elements
         void *gmem_sfa;
-        uint32_t stride_sfa;  // row stride of sfa in float elements (= M for MN-major)
+        uint32_t stride_sfa;  // row stride of sfa in float elements (= sf_k for K-major row-major)
         void *gather_index;   // optional int32 row remap for A/sfa; nullptr keeps logical rows
         // Per-rank ready-flag overlap (optional): set all three together. See
         // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md for the contract.
@@ -159,15 +159,11 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         const int num_m_tiles = (m + config.layout.block_m - 1) / config.layout.block_m;
         DG_HOST_ASSERT(tile_rank->numel() >= num_m_tiles);
     }
-    // cp.async path: raw pointer and SFA stride (in elements).
-    // NOTE: read stride from the layout-transformed sfa instead of hard-coding
-    // `m`. After `transform_sf_into_required_layout` the SFA is MN-major with
-    // K-stride == `tma_aligned_size(mn, 4) = align(mn, 4)`. Using `sfa.stride(-1)`
-    // (a) handles `m % 4 != 0` correctly (would otherwise read padding garbage
-    // between SFA rows), and (b) supports gather where the caller passed an
-    // m_pool-row SFA.
+    // cp.async path: SFA is row-major [m, sf_k] (K-major): stride = sf_k = sfa.stride(0) (or stride(-2) for 3D).
+    DG_HOST_ASSERT(sfa.stride(-1) == 1);
+    DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-1));
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
     // TMA descriptors (A/sfa kept for reference, currently unused in kernel)
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
@@ -288,10 +284,10 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         const int num_m_tiles = (m + config.layout.block_m - 1) / config.layout.block_m;
         DG_HOST_ASSERT(tile_rank->numel() >= num_m_tiles);
     }
+    DG_HOST_ASSERT(sfa.stride(-1) == 1);
+    DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
-    // Read SFA stride from the layout-transformed sfa tensor; see the comment in
-    // `sm90_fp8_gemm_1d2d` above for rationale (handles m % 4 != 0 + gather m_pool).
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-1));
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -367,8 +363,10 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    DG_HOST_ASSERT(sfa.stride(-1) == 1);
+    DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(get_non_contiguous_dim(major_a)));
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
@@ -443,8 +441,10 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
     // For BMM: a shape is [batch_size, m, k], stride along m-dim = k (fp8 elements)
+    DG_HOST_ASSERT(sfa.stride(-1) == 1);
+    DG_HOST_ASSERT(sfa.stride(-2) == sfa.size(-1));
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(1));
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(m);
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-2));
 
     const int load_block_m = config.storage_config.load_block_m;
     const auto tensor_map_a = make_tma_3d_desc(a, k, m, batch_size,

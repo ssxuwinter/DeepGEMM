@@ -165,7 +165,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const __nv_fp8_e4m3* __restrict__ gmem_a,
                         uint32_t stride_a,          // row stride of A in fp8 elements
                         const float* __restrict__ gmem_sfa,
-                        uint32_t stride_sfa,        // row stride of sfa in float elements (= M for MN-major)
+                        uint32_t stride_sfa,        // row stride of sfa in float elements (= sf_k for K-major row-major)
                         const int* __restrict__ gather_index,
                         // Per-rank ready-flag overlap (optional). All three must be set together
                         // (or all unset). See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
@@ -557,7 +557,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         // pointer; HW won't dereference it because src_size = 0.
                         const float* src_sfa = is_pad_sfa
                             ? gmem_sfa
-                            : gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i];
+                            // : gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i];
+                            : gmem_sfa + source_m_for_sfa[i] * stride_sfa + sfa_k_idx;
                         asm volatile(
                             "cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
                             :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
