@@ -64,7 +64,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             // See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
                             const std::optional<torch::Tensor>& rank_flags = std::nullopt,
                             const std::optional<torch::Tensor>& tile_rank = std::nullopt,
-                            const std::optional<int>& num_ranks = std::nullopt) {
+                            const std::optional<int>& num_ranks = std::nullopt,
+                            const std::optional<int64_t>& rank_flag_epoch = std::nullopt) {
     // Shape must be `[M, K] @ [N, K].T`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -98,7 +99,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const bool has_overlap = rank_flags.has_value();
     if (has_overlap) {
         DG_HOST_ASSERT(gather_index.has_value() and "rank_flags requires gather_index");
-        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value());
+        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value() and rank_flag_epoch.has_value());
     } else {
         DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
     }
@@ -125,7 +126,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         } else {
             const auto major_sfb = get_major_type_ab(sfb);
             sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims,
-                               std::nullopt, gather_index, rank_flags, tile_rank, num_ranks);
+                               std::nullopt, gather_index, rank_flags, tile_rank, num_ranks, rank_flag_epoch);
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         DG_HOST_ASSERT(not gather_index.has_value());
@@ -193,7 +194,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
                                                  const std::optional<torch::Tensor>& rank_flags = std::nullopt,
                                                  const std::optional<torch::Tensor>& tile_rank = std::nullopt,
-                                                 const std::optional<int>& num_ranks = std::nullopt) {
+                                                 const std::optional<int>& num_ranks = std::nullopt,
+                                                 const std::optional<int64_t>& rank_flag_epoch = std::nullopt) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -224,7 +226,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     const bool has_overlap = rank_flags.has_value();
     if (has_overlap) {
         DG_HOST_ASSERT(gather_index.has_value() and "rank_flags requires gather_index");
-        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value());
+        DG_HOST_ASSERT(tile_rank.has_value() and num_ranks.has_value() and rank_flag_epoch.has_value());
     } else {
         DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
     }
@@ -249,10 +251,35 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     if (m == 0)
         return;
 
-    // Transform SFA and SFB into compute-required layout. SFA must match the A
-    // pool (m_pool rows), not the GEMM output m.
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m_pool, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
+    // Transform SFB into compute-required layout. For gather-index SM90 paths,
+    // keep SFA in its original row-major per-token layout: SFA is read through
+    // gather_index, so the MN-major transform no longer guarantees coalescing
+    // and only delays the overlap GEMM launch.
+    if (not recipe_a.has_value() and not recipe.has_value())
+        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+    DG_HOST_ASSERT(recipe_a.has_value() == recipe_b.has_value());
+    DG_HOST_ASSERT(recipe_a.has_value() != recipe.has_value());
+
+    int gran_k_a, gran_k_b;
+    torch::Tensor sfa, sfb;
+    const bool use_raw_sfa = has_overlap and arch_major == 9 and a.second.scalar_type() == torch::kFloat;
+    if (recipe.has_value()) {
+        const int gran_mn_a = std::get<0>(recipe.value());
+        gran_k_a = std::get<2>(recipe.value());
+        gran_k_b = std::get<2>(recipe.value());
+        sfa = use_raw_sfa
+            ? check_sf_layout(a.second, m_pool, k, gran_mn_a, gran_k_a, std::nullopt, false, false, torch::kFloat)
+            : layout::transform_sf_into_required_layout(a.second, m_pool, k, recipe.value(), std::nullopt, true, disable_ue8m0_cast);
+        sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), num_groups, false, disable_ue8m0_cast);
+    } else {
+        const int gran_mn_a = std::get<0>(recipe_a.value());
+        gran_k_a = std::get<1>(recipe_a.value());
+        gran_k_b = std::get<1>(recipe_b.value());
+        sfa = use_raw_sfa
+            ? check_sf_layout(a.second, m_pool, k, gran_mn_a, gran_k_a, std::nullopt, false, false, torch::kFloat)
+            : layout::transform_sf_into_required_layout(a.second, m_pool, k, recipe_a.value(), std::nullopt, std::nullopt, disable_ue8m0_cast);
+        sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe_b.value(), num_groups, std::nullopt, disable_ue8m0_cast);
+    }
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
@@ -260,7 +287,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout,
-                                                gather_index, rank_flags, tile_rank, num_ranks);
+                                                gather_index, rank_flags, tile_rank, num_ranks, rank_flag_epoch);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         DG_HOST_ASSERT(not gather_index.has_value());
         DG_HOST_ASSERT(not has_overlap);
@@ -676,7 +703,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("gather_index") = std::nullopt,
           py::arg("rank_flags") = std::nullopt,
           py::arg("tile_rank") = std::nullopt,
-          py::arg("num_ranks") = std::nullopt);
+          py::arg("num_ranks") = std::nullopt,
+          py::arg("rank_flag_epoch") = std::nullopt);
     m.def("fp8_fp4_gemm_nn", &fp8_fp4_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
@@ -706,7 +734,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("gather_index") = std::nullopt,
           py::arg("rank_flags") = std::nullopt,
           py::arg("tile_rank") = std::nullopt,
-          py::arg("num_ranks") = std::nullopt);
+          py::arg("num_ranks") = std::nullopt,
+          py::arg("rank_flag_epoch") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,

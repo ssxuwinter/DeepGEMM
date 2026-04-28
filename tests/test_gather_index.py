@@ -282,8 +282,8 @@ def test_gather_m_grouped_gemm_contiguous() -> None:
         deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout())
 
     # Same coverage as `test_fp8_fp4.py:test_m_grouped_gemm_contiguous`.
-    m_group_list = [(4, 8192), (8, 4096)]
-    n_k_list = [(7168, 3072), (4096, 4096), (4096, 2048)]
+    m_group_list = [(4, 8192), (8, 4096), (64, 2090)]
+    n_k_list = [(7168, 3072), (4096, 4096), (4096, 2048), (2560, 2048)]
 
     summary = []
     for use_psum_layout in (False, True):

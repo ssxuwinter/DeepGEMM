@@ -70,8 +70,14 @@ try:
         tf32_hc_prenorm_gemm,
         # Single-node symmetric-memory all-gather helpers
         stream_write_value64,
+        stream_write_value64_ptr,
+        stream_wait_value64_ptr,
+        cuda_ipc_get_mem_handle,
+        cuda_ipc_alloc_i64,
+        cuda_ipc_open_mem_handles,
         single_node_allgather_copy_local,
         single_node_allgather_pull,
+        single_node_allgather_pull_with_ready_flags,
         single_node_allgather,
         # Layout kernels
         transform_sf_into_required_layout,

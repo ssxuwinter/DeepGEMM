@@ -165,20 +165,24 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const __nv_fp8_e4m3* __restrict__ gmem_a,
                         uint32_t stride_a,          // row stride of A in fp8 elements
                         const float* __restrict__ gmem_sfa,
-                        uint32_t stride_sfa,        // row stride of sfa in float elements (= M for MN-major)
+                        uint32_t stride_sfa,        // MN-major: K-scale stride; raw row-major: row stride
+                        bool sfa_is_mn_major,
                         const int* __restrict__ gather_index,
-                        // Per-rank ready-flag overlap (optional). All three must be set together
+                        // Per-rank ready-flag overlap (optional). All four must be set together
                         // (or all unset). See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
-                        //   rank_flags : (num_ranks,) int64 on global memory; bit set to 1 by the
-                        //                writer (e.g. all-gather kernel) once that rank's tokens
-                        //                are visible in `gmem_a`. Read with `ld.acquire.sys`.
-                        //   tile_rank  : (ceil(shape_m/BLOCK_M),) int32. Each entry is the unique
-                        //                rank that the corresponding M tile depends on (host
-                        //                guarantees that all non-pad rows in a tile share the rank).
-                        //   num_ranks  : runtime rank count, must satisfy `num_ranks <= 8`.
+                        //   rank_flags      : (num_ranks,) int64 on global memory; written to
+                        //                     `rank_flag_epoch` by the comm stream once that rank's
+                        //                     tokens are visible in `gmem_a`.
+                        //   tile_rank       : (ceil(shape_m/BLOCK_M),) int32. Each entry is the
+                        //                     unique rank that the corresponding M tile depends on.
+                        //   num_ranks       : runtime rank count, must satisfy `num_ranks <= 8`.
+                        //   rank_flag_epoch : monotonically increasing epoch; the kernel spins
+                        //                     until `ld.acquire.sys(rank_flags[r]) >= epoch`.
+                        //                     Eliminates the need to zero rank_flags each round.
                         const uint64_t* __restrict__ rank_flags,
                         const int* __restrict__ tile_rank,
                         uint32_t num_ranks,
+                        uint64_t rank_flag_epoch,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
@@ -260,9 +264,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     auto empty_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + 1 * kNumStages + i; });
 
     // Per-rank "ready seen" cache for the gather + per-rank-flag overlap path.
-    // 8 entries (kNumRanksMax = 8 = NVL8 upper bound). Producer WG's elected
-    // thread spins on `rank_flags[r]` once per (CTA, rank) and writes 1 here on
-    // success; subsequent tiles from the same rank skip the spin via cache hit.
+    // 8 entries (kNumRanksMax = 8 = NVL8 upper bound). All 128 producer-WG
+    // threads check s_rank_seen[r] via volatile smem read; if 0 they each
+    // spin on rank_flags[r] with ld.acquire.sys. The elected thread writes
+    // s_rank_seen[r] = 1 after the spin so subsequent tiles skip via cache hit.
     //
     // Lives in dynamic smem after the barriers; the host's smem_size reservation
     // for `kNumMaxStages * 8 * 3` barriers (see `get_pipeline_config` in
@@ -306,8 +311,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
-        // Zero-init the per-rank "seen" cache. Only used when `rank_flags != nullptr`,
-        // but always cleared so the runtime check inside the producer loop is uniform.
+        // Zero-init the per-rank "seen" cache. Only used when
+        // `rank_flags != nullptr`, but always cleared so the runtime check
+        // inside the producer loop is uniform.
         #pragma unroll
         for (uint32_t i = 0; i < kNumRanksMax; ++ i)
             s_rank_seen[i] = 0;
@@ -389,48 +395,30 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             const uint32_t m_global_base = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
 
             // ----- Per-rank ready-flag wait (gather + overlap path only) -----
-            // Once per (CTA, rank). Elected lane in warp 0 spins on
-            // `rank_flags[r]` with system-scope acquire semantics. After it sees
-            // 1, it caches the result in `s_rank_seen[r]` (lives in dynamic smem,
-            // initialized to 0) and the rest of the producer WG is released by
-            // NamedBarrier::sync(2). Subsequent tiles for the same rank are
-            // free (cache hit, no spin, NamedBarrier-only).
             //
-            // **Fence after barrier**: `ld.acquire.sys` only orders the elected
-            // thread's *own* subsequent loads. The other 127 producer-WG threads
-            // wake up from NamedBarrier::sync(2) but have no acquire of their
-            // own — and `bar.sync` is a CTA-scope memory fence, not a system-
-            // scope one. So we explicitly issue `membar.sys` after the barrier
-            // to lift the elected thread's acquire to a CTA-wide guarantee:
-            // every producer-WG thread now sees a system-coherent view of A_pool
-            // before issuing cp.async. Without this, ~5% of overlap-mode
-            // iterations on H800/CUDA-12.2 produced a tiny but consistent
-            // numerical drift (~1e-2) in the GEMM result.
+            // All 128 producer-WG threads read tile_rank (L2 broadcast) and
+            // check s_rank_seen[r] via volatile smem read.
+            //
+            // Fast path (cached rank): volatile read sees 1 → skip.
+            //   Cost: __ldg + volatile smem read + branch ≈ 0.1 us.
+            //
+            // Slow path (new rank): all 128 threads each spin on rank_flags[r]
+            //   with ld.acquire.sys. Each thread independently gets system-scope
+            //   visibility — subsequent cp.async from gmem_a sees remote writes.
+            //   No NamedBarrier or membar.sys needed.
+            //   Cost: 128 threads × ld.acquire.sys broadcast ≈ 1 us.
+            //
+            // See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md §14.
             if (has_rank_flags) {
-                if (warp_in_wg == 0 and cute::elect_one_sync()) {
-                    const uint32_t r = static_cast<uint32_t>(__ldg(tile_rank + m_block_idx));
-                    // Defensive bound check: corrupt `tile_rank` would otherwise scribble
-                    // past `s_rank_seen` and read garbage from `rank_flags`.
-                    DG_TRAP_ONLY_DEVICE_ASSERT(r < num_ranks and r < kNumRanksMax);
-                    if (s_rank_seen[r] == 0) {
-                        // Spin with `ld.acquire.sys`: pairs with a remote
-                        // `st.release.sys` (or fence + relaxed store) on the
-                        // writer side, so seeing flag = 1 also implies all of
-                        // that rank's writes to gmem_a are visible.
-                        while (deep_gemm::ptx::ld_acq_sys(rank_flags + r) == 0) {
-                            // Spin. The flag is monotonic 0 → 1 within a launch;
-                            // host is responsible for clearing between launches.
-                        }
+                const uint32_t r = static_cast<uint32_t>(__ldg(tile_rank + m_block_idx));
+                DG_TRAP_ONLY_DEVICE_ASSERT(r < num_ranks and r < kNumRanksMax);
+                if (*reinterpret_cast<volatile uint32_t*>(s_rank_seen + r) == 0) {
+                    while (deep_gemm::ptx::ld_acq_sys(rank_flags + r) < rank_flag_epoch) {
+                    }
+                    if (warp_in_wg == 0 and cute::elect_one_sync()) {
                         s_rank_seen[r] = 1;
                     }
                 }
-                // Use a kernel-unique NamedBarrier id (0 and 1 are owned by the
-                // math WG); 2 is the first free slot.
-                cutlass::arch::NamedBarrier::sync(kCpAsyncThreads, 2);
-                // Promote the elected thread's `ld.acquire.sys` to a system-
-                // scope fence visible to every producer-WG thread (see comment
-                // block above for rationale).
-                asm volatile("membar.sys;" ::: "memory");
             }
             // -----------------------------------------------------------------
 
@@ -557,7 +545,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         // pointer; HW won't dereference it because src_size = 0.
                         const float* src_sfa = is_pad_sfa
                             ? gmem_sfa
-                            : gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i];
+                            : (sfa_is_mn_major
+                                ? gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i]
+                                : gmem_sfa + source_m_for_sfa[i] * stride_sfa + sfa_k_idx);
                         asm volatile(
                             "cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
                             :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),

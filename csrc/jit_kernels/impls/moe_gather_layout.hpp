@@ -154,11 +154,13 @@ static void __instantiate_kernel() {{
 // -----------------------------------------------------------------------------
 // Host entry: build_gather_layout_for_rank_overlap
 //
-// Returns the four tensors needed by the rank-overlap GEMM path:
-//   gather_index:      (M_max,)        int32, pad rows = -1
+// Returns five tensors needed by the rank-overlap GEMM path:
+//   gather_index:      (M_max,)           int32, pad rows = -1
 //   tile_rank:         (num_m_tiles_max,) int32
-//   grouped_layout:    (M_max,)        int32, pad rows still hold the chunk's expert id
-//   m_logical_tensor:  (1,)            int32, the actual padded M (use .item() to read)
+//   grouped_layout:    (M_max,)           int32, per-row expert id (for psum=0)
+//   m_logical_tensor:  (1,)               int32, the actual padded M
+//   psum_layout:       (num_experts,)     int32, cumulative M boundary per expert
+//                      (for use_psum_layout=True — pass as grouped_layout to GEMM)
 //
 // `M_max` is an analytical upper bound (tight enough that real workloads see
 // ~70% utilization on the H800 reference shape — vs. ~3.5% under the previous
@@ -176,8 +178,10 @@ static void __instantiate_kernel() {{
 // Caller may pass `gather_index` / `grouped_layout` directly to the GEMM, which
 // reads only the first `m_logical` rows; `tile_rank` is similarly over-
 // allocated and only the first `ceil(m_logical / block_m)` entries matter.
+// For the psum path, pass `psum_layout` as the grouped_layout argument with
+// `use_psum_layout=True`.
 // -----------------------------------------------------------------------------
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 build_gather_layout_for_rank_overlap(
     const torch::Tensor& routing_topk,
     const int& local_rank,
@@ -330,7 +334,19 @@ build_gather_layout_for_rank_overlap(
         GatherLayoutScatterRuntime::launch(runtime, args);
     }
 
-    return std::make_tuple(gather_index, tile_rank, grouped_layout, m_logical_tensor);
+    // ---------- Derive psum_layout from padded_starts + m_logical ----------
+    // psum_layout[e] = cumulative M boundary after expert e.
+    // Since the layout is expert-major (ring-step-minor within each expert),
+    // the end of expert e = start of expert (e+1)'s first chunk, which is
+    // padded_starts[e+1, 0]. The last expert ends at m_logical.
+    auto psum_layout = torch::empty({num_experts}, opts_int32);
+    if (num_experts > 1) {
+        psum_layout.slice(0, 0, num_experts - 1).copy_(
+            padded_starts.slice(0, 1, num_experts).select(1, 0));
+    }
+    psum_layout.slice(0, num_experts - 1, num_experts).copy_(m_logical_tensor);
+
+    return std::make_tuple(gather_index, tile_rank, grouped_layout, m_logical_tensor, psum_layout);
 }
 
 }  // namespace deep_gemm

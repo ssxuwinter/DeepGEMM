@@ -6,6 +6,7 @@ dist
 *.egg-info
 *.pyc
 .venv/*
+*.json
 
 # Third-party links created by `setup.py develop`
 deep_gemm/include/cute
