@@ -2,6 +2,7 @@
 #include <torch/python.h>
 
 #include "apis/attention.hpp"
+#include "apis/comm.hpp"
 #include "apis/einsum.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
@@ -19,6 +20,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // TODO: make SM80 incompatible issues raise errors
     deep_gemm::attention::register_apis(m);
+    deep_gemm::comm::register_apis(m);
     deep_gemm::einsum::register_apis(m);
     deep_gemm::hyperconnection::register_apis(m);
     deep_gemm::gemm::register_apis(m);

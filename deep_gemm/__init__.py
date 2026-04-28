@@ -68,8 +68,16 @@ try:
         fp8_paged_mqa_logits,
         # Hyperconnection kernels
         tf32_hc_prenorm_gemm,
+        # Single-node symmetric-memory all-gather helpers
+        stream_write_value64,
+        single_node_allgather_copy_local,
+        single_node_allgather_pull,
+        single_node_allgather,
         # Layout kernels
         transform_sf_into_required_layout,
+        # MoE rank-overlap layout generator (see
+        # docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md §11)
+        build_gather_layout_for_rank_overlap,
     )
 
     # Some alias for legacy supports
